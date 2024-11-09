@@ -1,0 +1,7 @@
+{% extends 'vintasend_django/emails/base_notification.html' %}
+
+{% block email_content %}
+    <h1>Test Templated Email</h1>
+    <p>This is a test email template.</p>
+    <p>{{test_body}}</p>
+{% endblock %}

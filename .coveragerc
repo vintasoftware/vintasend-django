@@ -1,0 +1,13 @@
+[run]
+branch = True
+source = vintasend_django
+
+[report]
+omit =
+    */tests/*
+    */migrations/*
+
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError

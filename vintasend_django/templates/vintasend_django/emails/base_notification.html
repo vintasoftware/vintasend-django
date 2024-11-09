@@ -1,0 +1,56 @@
+<!-- html template for email notifications -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            color: #333;
+        }
+        .container {
+            width: 100%;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .preheader {
+            display: none !important;
+            visibility: hidden;
+            font-size: 1px;
+            line-height: 1px;
+            max-height: 0px;
+            max-width: 0px;
+            opacity: 0;
+            overflow: hidden;
+        }
+        .header {
+            background-color: #f8f8f8;
+            padding: 10px;
+            text-align: center;
+        }
+        .content {
+            padding: 20px;
+        }
+        .footer {
+            background-color: #f8f8f8;
+            padding: 10px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="preheader">{{ private_preheader | safe}}</div>
+    <div class="container">
+        <div class="header">
+            {% block email_header %}{% endblock %}
+        </div>
+        <div class="content">
+            {% block email_content %}{% endblock %}
+        </div>
+        <div class="footer">
+            {% block email_footer %}<p>Thank you for using Agemo.</p>{% endblock %}
+        </div>
+    </div>
+</html>
