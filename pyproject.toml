@@ -16,6 +16,7 @@ django-model-utils = "^5.0.0"
 [tool.poetry.group.dev.dependencies]
 freezegun = "^1.5.1"
 coverage = "^7.6.4"
+django-stubs = {version = "^5.1.1", extras=["compatible-mypy"]}
 tox = "^4.23.2"
 pytest = "^8.3.3"
 pytest-xdist = {version = "^3.6.1", extras=["psutil"]}
@@ -28,6 +29,11 @@ model-bakery = "^1.20.0"
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
+[tool.mypy]
+plugins = ["mypy_django_plugin.main"]
+
+[tool.django-stubs]
+django_settings_module = "settings.test"
 
 [tool.ruff]
 select = [

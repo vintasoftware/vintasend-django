@@ -1,6 +1,5 @@
 from typing import TYPE_CHECKING
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import EmailMessage
 
@@ -8,7 +7,6 @@ from vintasend.constants import NotificationTypes
 from vintasend.exceptions import (
     NotificationSendError,
     NotificationTemplateRenderingError,
-    NotificationUserNotFoundError,
 )
 from vintasend.services.dataclasses import Notification
 from vintasend.services.helpers import get_notification_backend, get_template_renderer
