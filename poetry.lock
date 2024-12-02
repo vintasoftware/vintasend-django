@@ -889,11 +889,14 @@ python-versions = "<3.13,>=3.9"
 files = []
 develop = false
 
+[package.dependencies]
+typing-extensions = "^4.12.2"
+
 [package.source]
 type = "git"
 url = "https://github.com/vintasoftware/vintasend.git"
 reference = "main"
-resolved_reference = "9c4887c34c33a2c78d066f90c138d2734cbbdde6"
+resolved_reference = "ea47934db12c737e77c3f37c845721295bb23fa3"
 
 [[package]]
 name = "virtualenv"

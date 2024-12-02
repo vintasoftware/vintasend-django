@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from django.contrib.auth import get_user_model
 from django.core.mail import EmailMessage
@@ -9,8 +9,9 @@ from vintasend.exceptions import (
     NotificationTemplateRenderingError,
 )
 from vintasend.services.dataclasses import Notification
-from vintasend.services.helpers import get_notification_backend, get_template_renderer
+from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
+from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplatedEmailRenderer
 from vintasend.app_settings import NotificationSettings
 
 
@@ -21,14 +22,11 @@ if TYPE_CHECKING:
 User = get_user_model()
 
 
-class DjangoEmailNotificationAdapter(BaseNotificationAdapter):
-    notification_type = NotificationTypes.EMAIL
+B = TypeVar("B", bound=BaseNotificationBackend)
+T = TypeVar("T", bound=BaseTemplatedEmailRenderer)
 
-    def __init__(
-        self, template_renderer: str, backend: str | None, backend_kwargs: dict | None = None
-    ) -> None:
-        self.backend = get_notification_backend(backend, backend_kwargs)
-        self.template_renderer = get_template_renderer(template_renderer)
+class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
+    notification_type = NotificationTypes.EMAIL
 
     def send(
         self,

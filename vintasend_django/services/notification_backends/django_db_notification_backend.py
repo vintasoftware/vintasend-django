@@ -21,6 +21,9 @@ from django.db.models import QuerySet
 
 
 class DjangoDbNotificationBackend(BaseNotificationBackend):
+    def __init__(self):
+        self.backend_kwargs = {}
+
     def _get_all_future_notifications_queryset(self) -> QuerySet["NotificationModel"]:
         return NotificationModel.objects.filter(
             Q(send_after__gte=datetime.datetime.now()) | Q(send_after__isnull=False),

@@ -1,4 +1,4 @@
-import uuid
+import random
 import pytest
 from datetime import timedelta
 
@@ -71,7 +71,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
 
         updated_notification = DjangoDbNotificationBackend().persist_notification_update(
             notification_id=notification.id,
-            subject_template="updated test subject",
+            updated_data={"subject_template": "updated test subject"},
         )
 
         assert updated_notification.subject_template == "updated test subject"
@@ -181,7 +181,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         )
         DjangoDbNotificationBackend().persist_notification_update(
             notification_id=already_sent.id,
-            status=NotificationStatus.SENT.value,
+            updated_data={"status": NotificationStatus.SENT.value},
         )
 
         notifications = list(
@@ -356,7 +356,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
 
     def test_get_notification_not_found(self):
         with pytest.raises(NotificationNotFoundError):
-            DjangoDbNotificationBackend().get_notification(uuid.uuid4())
+            DjangoDbNotificationBackend().get_notification(random.randint(1, 100))
 
     def test_get_notification_cancelled(self):
         notification = DjangoDbNotificationBackend().persist_notification(
