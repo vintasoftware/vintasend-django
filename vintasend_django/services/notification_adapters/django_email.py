@@ -13,6 +13,7 @@ from vintasend.services.notification_backends.base import BaseNotificationBacken
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplatedEmailRenderer
 from vintasend.app_settings import NotificationSettings
+from vintasend.constants import NotificationStatus
 
 
 if TYPE_CHECKING:
@@ -49,11 +50,7 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
         context_with_base_url: "NotificationContextDict" = context.copy()
         context_with_base_url["base_url"] = f"{notification_settings.NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL}://{notification_settings.NOTIFICATION_DEFAULT_BASE_URL_DOMAIN}"
 
-        try:
-            template = self.template_renderer.render(notification, context_with_base_url)
-        except NotificationTemplateRenderingError as e:
-            self.backend.mark_pending_as_failed(notification.id)
-            raise NotificationTemplateRenderingError() from e
+        template = self.template_renderer.render(notification, context_with_base_url)
 
         email = EmailMessage(
             subject=template.subject.strip(),
@@ -65,10 +62,4 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
         )
         email.content_subtype = "html"
 
-        try:
-            email.send()
-        except Exception as e:  # noqa: BLE001
-            self.backend.mark_pending_as_failed(notification.id)
-            raise NotificationSendError() from e
-
-        self.backend.mark_pending_as_sent(notification.id)
+        email.send()
