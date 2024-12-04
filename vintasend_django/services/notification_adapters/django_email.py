@@ -4,16 +4,12 @@ from django.contrib.auth import get_user_model
 from django.core.mail import EmailMessage
 
 from vintasend.constants import NotificationTypes
-from vintasend.exceptions import (
-    NotificationSendError,
-    NotificationTemplateRenderingError,
-)
+
 from vintasend.services.dataclasses import Notification
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplatedEmailRenderer
 from vintasend.app_settings import NotificationSettings
-from vintasend.constants import NotificationStatus
 
 
 if TYPE_CHECKING:
