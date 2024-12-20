@@ -1,11 +1,10 @@
+from django.contrib.auth import get_user_model
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from model_utils.fields import AutoCreatedField, AutoLastModifiedField
 
 from vintasend_django.constants import NotificationStatusChoices, NotificationTypesChoices
-
-from django.contrib.auth import get_user_model
 
 
 User = get_user_model()
@@ -30,7 +29,7 @@ class Notification(models.Model):
     created = AutoCreatedField(_("created"), db_index=True)
     modified = AutoLastModifiedField(_("modified"), db_index=True)
 
-    meta = models.JSONField(_("meta"), default=dict, blank=True)
+    metadata = models.JSONField(_("metadata"), default=dict, blank=True)
 
     context_used = models.JSONField(_("context used when notification was sent"), null=True)
 

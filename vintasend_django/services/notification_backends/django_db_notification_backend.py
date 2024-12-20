@@ -2,7 +2,7 @@ import datetime
 import uuid
 from collections.abc import Iterable
 
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
@@ -16,8 +16,8 @@ from vintasend.services.dataclasses import (
     UpdateNotificationKwargs,
 )
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+
 from vintasend_django.models import Notification as NotificationModel
-from django.db.models import QuerySet
 
 
 class DjangoDbNotificationBackend(BaseNotificationBackend):
@@ -72,6 +72,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
+        metadata: dict | None = None,
     ) -> Notification:
         notification_instance = NotificationModel.objects.create(
             user_id=str(user_id),

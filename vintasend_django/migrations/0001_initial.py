@@ -80,10 +80,6 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 (
-                    "meta",
-                    models.JSONField(blank=True, default=dict, verbose_name="meta"),
-                ),
-                (
                     "context_used",
                     models.JSONField(
                         null=True,
@@ -95,6 +91,13 @@ class Migration(migrations.Migration):
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
                         to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
+                (
+                    "metadata",
+                    models.JSONField(
+                        null=True,
+                        verbose_name="Metadata for the notification adapter",
                     ),
                 ),
             ],
