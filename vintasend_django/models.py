@@ -29,9 +29,10 @@ class Notification(models.Model):
     created = AutoCreatedField(_("created"), db_index=True)
     modified = AutoLastModifiedField(_("modified"), db_index=True)
 
-    metadata = models.JSONField(_("metadata"), default=dict, blank=True)
+    adapter_extra_parameters = models.JSONField(_("adapter_extra_parameters"), null=True)
 
     context_used = models.JSONField(_("context used when notification was sent"), null=True)
+    adapter_used = models.CharField(_("adapter used to send the notification"), max_length=255, null=True)
 
     objects: models.Manager["Notification"]
 

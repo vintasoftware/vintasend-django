@@ -94,10 +94,18 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 (
-                    "metadata",
+                    "adapter_extra_parameters",
                     models.JSONField(
                         null=True,
-                        verbose_name="Metadata for the notification adapter",
+                        verbose_name="Extra parameters for the notification adapter",
+                    ),
+                ),
+                (
+                    "adapter_used",
+                    models.CharField(
+                        max_length=255,
+                        null=True,
+                        verbose_name="Adapter used to send the notification",
                     ),
                 ),
             ],

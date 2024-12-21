@@ -26,24 +26,30 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             Q(send_after__gte=datetime.datetime.now()) | Q(send_after__isnull=False),
             status=NotificationStatus.PENDING_SEND.value,
         ).order_by("created")
-    
-    def _get_all_in_app_unread_notifications_queryset(self, user_id: int | str | uuid.UUID) -> QuerySet["NotificationModel"]:
+
+    def _get_all_in_app_unread_notifications_queryset(
+        self, user_id: int | str | uuid.UUID
+    ) -> QuerySet["NotificationModel"]:
         return NotificationModel.objects.filter(
             user_id=str(user_id),
             status=NotificationStatus.SENT.value,
             notification_type=NotificationTypes.IN_APP,
         ).order_by("created")
-    
+
     def _get_all_pending_notifications_queryset(self) -> QuerySet["NotificationModel"]:
         return NotificationModel.objects.filter(
             Q(send_after__lte=datetime.datetime.now()) | Q(send_after__isnull=True),
             status=NotificationStatus.PENDING_SEND.value,
         ).order_by("created")
-    
-    def _paginate_queryset(self, queryset: "QuerySet[NotificationModel]", page: int, page_size: int) -> QuerySet["NotificationModel"]:
+
+    def _paginate_queryset(
+        self, queryset: "QuerySet[NotificationModel]", page: int, page_size: int
+    ) -> QuerySet["NotificationModel"]:
         return queryset[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
-    
-    def _serialize_notification_queryset(self, queryset: "QuerySet[NotificationModel]") -> Iterable[Notification]:
+
+    def _serialize_notification_queryset(
+        self, queryset: "QuerySet[NotificationModel]"
+    ) -> Iterable[Notification]:
         return (self.serialize_notification(n) for n in queryset.iterator())
 
     def serialize_notification(self, notification: NotificationModel) -> Notification:
@@ -72,7 +78,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
-        metadata: dict | None = None,
+        adapter_extra_parameters: dict | None = None,
     ) -> Notification:
         notification_instance = NotificationModel.objects.create(
             user_id=str(user_id),
@@ -84,6 +90,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             send_after=send_after,
             subject_template=subject_template or "",
             preheader_template=preheader_template or "",
+            adapter_extra_parameters=adapter_extra_parameters,
         )
         return self.serialize_notification(notification_instance)
 
@@ -144,22 +151,16 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         except NotificationModel.DoesNotExist as e:
             raise NotificationNotFoundError("Notification not found") from e
         return self.serialize_notification(notification_instance)
-    
+
     def get_all_pending_notifications(self) -> Iterable[Notification]:
-        return (
-            self._serialize_notification_queryset(
-                self._get_all_pending_notifications_queryset()
-            )
-        )
+        return self._serialize_notification_queryset(self._get_all_pending_notifications_queryset())
 
     def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
-        return (
-            self._serialize_notification_queryset(
-                self._paginate_queryset(
-                    self._get_all_pending_notifications_queryset(),
-                    page,
-                    page_size,
-                )
+        return self._serialize_notification_queryset(
+            self._paginate_queryset(
+                self._get_all_pending_notifications_queryset(),
+                page,
+                page_size,
             )
         )
 
@@ -167,10 +168,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         self,
         user_id: int | str | uuid.UUID,
     ) -> Iterable[Notification]:
-        return (
-            self._serialize_notification_queryset(
-                self._get_all_in_app_unread_notifications_queryset(user_id),
-            )
+        return self._serialize_notification_queryset(
+            self._get_all_in_app_unread_notifications_queryset(user_id),
         )
 
     def filter_in_app_unread_notifications(
@@ -179,49 +178,54 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         page: int = 1,
         page_size: int = 10,
     ) -> Iterable[Notification]:
-        return (
-            self._serialize_notification_queryset(
-                self._paginate_queryset(
-                    self._get_all_in_app_unread_notifications_queryset(user_id),
-                    page,
-                    page_size,
-                )
+        return self._serialize_notification_queryset(
+            self._paginate_queryset(
+                self._get_all_in_app_unread_notifications_queryset(user_id),
+                page,
+                page_size,
             )
         )
 
     def get_all_future_notifications(self) -> Iterable["Notification"]:
-        return self._serialize_notification_queryset(
-            self._get_all_future_notifications_queryset()
-        )
-    
+        return self._serialize_notification_queryset(self._get_all_future_notifications_queryset())
+
     def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
         return self._serialize_notification_queryset(
-            self._paginate_queryset(
-                self._get_all_future_notifications_queryset(),
-                page,
-                page_size
-            )
+            self._paginate_queryset(self._get_all_future_notifications_queryset(), page, page_size)
         )
-    
-    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> Iterable["Notification"]:
+
+    def get_all_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID
+    ) -> Iterable["Notification"]:
         return self._serialize_notification_queryset(
             self._get_all_future_notifications_queryset().filter(user_id=str(user_id))
         )
-    
-    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> Iterable["Notification"]:
+
+    def get_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> Iterable["Notification"]:
         return self._serialize_notification_queryset(
             self._paginate_queryset(
                 self._get_all_future_notifications_queryset().filter(user_id=str(user_id)),
                 page,
-                page_size
+                page_size,
             )
         )
 
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
-        notification_user = NotificationModel.objects.select_related("user").get(id=str(notification_id)).user
+        notification_user = (
+            NotificationModel.objects.select_related("user").get(id=str(notification_id)).user
+        )
         if not notification_user or not notification_user.is_active:
             raise NotificationUserNotFoundError("User not found")
         return notification_user.email
 
-    def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
-        NotificationModel.objects.filter(id=str(notification_id)).update(context_used=context)
+    def store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: dict,
+        adapter_import_str: str,
+    ) -> None:
+        NotificationModel.objects.filter(id=str(notification_id)).update(
+            context_used=context, adapter_used=adapter_import_str
+        )

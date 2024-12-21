@@ -915,7 +915,7 @@ typing-extensions = "^4.12.2"
 type = "git"
 url = "https://github.com/vintasoftware/vintasend.git"
 reference = "main"
-resolved_reference = "e11aee682b0cc8d36975401576eeb6dbe8d344d9"
+resolved_reference = "49f054545efbfaf8a567f4021fb180b85c2f259b"
 
 [[package]]
 name = "virtualenv"
