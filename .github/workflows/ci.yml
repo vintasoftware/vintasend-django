@@ -37,6 +37,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: vintasoftware/vintasend-django
           fail_ci_if_error: false
-          files: ./coverage-${{ matrix.python-version }}.xml
+          directory: ./
+          files: ./coverage-*.xml
           flags: python-${{ matrix.python-version }}
           name: codecov-${{ matrix.python-version }}
