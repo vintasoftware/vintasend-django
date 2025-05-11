@@ -1,15 +1,15 @@
 [tool.poetry]
 name = "vintasend-django"
-version = "0.1.0"
+version = "0.1.1"
 description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "<3.13,>=3.10"
-django = "^5.1.3"
-vintasend = { git = "https://github.com/vintasoftware/vintasend.git", branch = "main" }
+python = "<3.14,>=3.10"
+django = "<5.3,>=3.2"
+vintasend = "*"
 django-model-utils = "^5.0.0"
 
 
@@ -20,7 +20,6 @@ django-stubs = {version = "^5.1.1", extras=["compatible-mypy"]}
 tox = "^4.23.2"
 pytest = "^8.3.3"
 pytest-xdist = {version = "^3.6.1", extras=["psutil"]}
-coveralls = "^4.0.1"
 pytest-cov = "^6.0.0"
 pytest-django = "^4.9.0"
 model-bakery = "^1.20.0"
