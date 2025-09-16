@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import os
 import uuid
 from collections.abc import Iterable
@@ -111,12 +112,26 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         """
         Convert Django attachment model to StoredAttachment.
 
-        Note: Checksum is not provided. If needed, implement checksum calculation.
+        Calculates SHA-256 checksum of the file content.
         """
+        # Calculate checksum by reading the file content
+        checksum = ""
+        if attachment.file:
+            try:
+                # Read file content and calculate SHA-256 hash
+                attachment.file.seek(0)  # Ensure we're at the beginning
+                file_content = attachment.file.read()
+                checksum = hashlib.sha256(file_content).hexdigest()
+                attachment.file.seek(0)  # Reset file position
+            except OSError:
+                # If file reading fails, use empty checksum
+                checksum = ""
+        
         return StoredAttachment(
             id=str(attachment.pk),
             filename=attachment.name,
             content_type=attachment.mime_type,
+            checksum=checksum,
             size=attachment.size or 0,
             created_at=attachment.created,
             file=DjangoAttachmentFile(attachment),

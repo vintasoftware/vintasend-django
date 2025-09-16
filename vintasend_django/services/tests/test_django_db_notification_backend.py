@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 import tempfile
@@ -46,6 +47,18 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
                     attachment.file.delete(save=False)
             except OSError:
                 pass  # File might already be deleted
+
+        # Additional cleanup: manually remove any remaining files in the attachments directory
+        import glob
+        attachment_dir = "notifications/attachments"
+        if os.path.exists(attachment_dir):
+            # Remove all files in the attachments directory
+            for file_path in glob.glob(os.path.join(attachment_dir, "*")):
+                try:
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+                except OSError:
+                    pass  # File might already be deleted
 
     def test_persist_notification(self):
         notification = DjangoDbNotificationBackend().persist_notification(
@@ -898,3 +911,186 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         assert attachment.filename == os.path.basename(tmp_file_path)
         assert attachment.content_type == 'application/octet-stream'
         assert attachment.size > 0
+
+    def test_serialize_attachment_checksum_calculation(self):
+        """Test that _serialize_attachment correctly calculates SHA-256 checksum"""
+        backend = DjangoDbNotificationBackend()
+        
+        # Create a temporary file with known content
+        test_content = b"Test content for checksum calculation"
+        expected_checksum = hashlib.sha256(test_content).hexdigest()
+        
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_file.write(test_content)
+            tmp_file_path = tmp_file.name
+        
+        self.temp_files.append(tmp_file_path)
+        
+        try:
+            # Create mock attachment and store it
+            mock_attachment = Mock(spec=NotificationAttachment)
+            mock_attachment.file_path = tmp_file_path
+            
+            stored_attachments = backend._store_attachments([mock_attachment])
+            attachment_instance = stored_attachments[0]
+            
+            # Set notification (required for save)
+            notification_instance = NotificationModel.objects.create(
+                user_id=str(self.user.pk),
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Checksum test",
+                body_template="test",
+                context_name="test",
+                context_kwargs={},
+            )
+            attachment_instance.notification = notification_instance
+            attachment_instance.save()
+            
+            # Test the _serialize_attachment method
+            stored_attachment = backend._serialize_attachment(attachment_instance)
+            
+            # Verify checksum is calculated correctly
+            assert stored_attachment.checksum == expected_checksum
+            assert len(stored_attachment.checksum) == 64  # SHA-256 hex length
+            assert stored_attachment.filename == os.path.basename(tmp_file_path)
+            assert stored_attachment.size == len(test_content)
+            
+        finally:
+            # Cleanup is handled by tearDown method
+            pass
+
+    def test_serialize_attachment_checksum_with_empty_file(self):
+        """Test checksum calculation with an empty file"""
+        backend = DjangoDbNotificationBackend()
+        
+        # Empty content should have specific SHA-256 hash
+        test_content = b""
+        expected_checksum = hashlib.sha256(test_content).hexdigest()
+        
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            # Don't write anything - file is empty
+            tmp_file_path = tmp_file.name
+        
+        self.temp_files.append(tmp_file_path)
+        
+        try:
+            # Create mock attachment and store it
+            mock_attachment = Mock(spec=NotificationAttachment)
+            mock_attachment.file_path = tmp_file_path
+            
+            stored_attachments = backend._store_attachments([mock_attachment])
+            attachment_instance = stored_attachments[0]
+            
+            # Set notification (required for save)
+            notification_instance = NotificationModel.objects.create(
+                user_id=str(self.user.pk),
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Empty checksum test",
+                body_template="test",
+                context_name="test",
+                context_kwargs={},
+            )
+            attachment_instance.notification = notification_instance
+            attachment_instance.save()
+            
+            # Test the _serialize_attachment method
+            stored_attachment = backend._serialize_attachment(attachment_instance)
+            
+            # Verify checksum for empty file
+            assert stored_attachment.checksum == expected_checksum
+            assert stored_attachment.checksum == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"  # SHA-256 of empty string
+            
+        finally:
+            # Cleanup is handled by tearDown method
+            pass
+
+    def test_serialize_attachment_checksum_with_binary_content(self):
+        """Test checksum calculation with binary content"""
+        backend = DjangoDbNotificationBackend()
+        
+        # Create binary content
+        test_content = bytes(range(256))  # All possible byte values
+        expected_checksum = hashlib.sha256(test_content).hexdigest()
+        
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            tmp_file.write(test_content)
+            tmp_file_path = tmp_file.name
+        
+        self.temp_files.append(tmp_file_path)
+        
+        try:
+            # Create mock attachment and store it
+            mock_attachment = Mock(spec=NotificationAttachment)
+            mock_attachment.file_path = tmp_file_path
+            
+            stored_attachments = backend._store_attachments([mock_attachment])
+            attachment_instance = stored_attachments[0]
+            
+            # Set notification (required for save)
+            notification_instance = NotificationModel.objects.create(
+                user_id=str(self.user.pk),
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Binary checksum test",
+                body_template="test",
+                context_name="test",
+                context_kwargs={},
+            )
+            attachment_instance.notification = notification_instance
+            attachment_instance.save()
+            
+            # Test the _serialize_attachment method
+            stored_attachment = backend._serialize_attachment(attachment_instance)
+            
+            # Verify checksum for binary content
+            assert stored_attachment.checksum == expected_checksum
+            assert len(stored_attachment.checksum) == 64  # SHA-256 hex length
+            assert stored_attachment.size == len(test_content)
+            
+        finally:
+            # Cleanup is handled by tearDown method
+            pass
+
+    def test_serialize_attachment_checksum_with_no_file(self):
+        """Test _serialize_attachment when attachment has no file"""
+        backend = DjangoDbNotificationBackend()
+        
+        # Create attachment without file
+        attachment_instance = AttachmentModel(
+            name="no_file_attachment",
+            mime_type="text/plain",
+            size=0,
+        )
+        
+        # Don't set the file field
+        
+        # Test the _serialize_attachment method
+        stored_attachment = backend._serialize_attachment(attachment_instance)
+        
+        # Should have empty checksum when no file
+        assert stored_attachment.checksum == ""
+        assert stored_attachment.filename == "no_file_attachment"
+        assert stored_attachment.size == 0
+
+    def test_serialize_attachment_checksum_with_file_read_error(self):
+        """Test _serialize_attachment handles file read errors gracefully"""
+        backend = DjangoDbNotificationBackend()
+        
+        # Create attachment with mock file that raises OSError
+        attachment_instance = AttachmentModel(
+            name="error_file_attachment",
+            mime_type="text/plain",
+            size=100,
+        )
+        
+        # Mock the file to raise an OSError when read
+        mock_file = Mock()
+        mock_file.seek.side_effect = OSError("File read error")
+        attachment_instance.file = mock_file
+        
+        # Test the _serialize_attachment method
+        stored_attachment = backend._serialize_attachment(attachment_instance)
+        
+        # Should have empty checksum when file read fails
+        assert stored_attachment.checksum == ""
+        assert stored_attachment.filename == "error_file_attachment"
+        assert stored_attachment.size == 100
