@@ -1,6 +1,7 @@
 import datetime
 import uuid
 from collections.abc import Iterable
+from typing import cast
 
 from django.db.models import Q, QuerySet
 
@@ -52,16 +53,28 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     ) -> QuerySet["NotificationModel"]:
         return queryset[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
 
-    def _serialize_notification_queryset(
+    def _serialize_user_notification_queryset(
         self, queryset: "QuerySet[NotificationModel]"
     ) -> Iterable[Notification]:
+        return (self.serialize_user_notification(n) for n in queryset.iterator())
+
+    def _serialize_notification_queryset(
+        self, queryset: "QuerySet[NotificationModel]"
+    ) -> Iterable[Notification | OneOffNotification]:
         return (self.serialize_notification(n) for n in queryset.iterator())
 
-    def serialize_notification(self, notification: NotificationModel) -> Notification:
-        user_id = notification.user.id if notification.user else 0  # Use 0 as default for None user
+    def serialize_notification(self, notification: NotificationModel) -> Notification | OneOffNotification:
+        if notification.user_id:
+            return self.serialize_user_notification(notification)
+        return self.serialize_one_off_notification(notification)
+
+    def serialize_user_notification(self, notification: NotificationModel) -> Notification:
+        if not notification.user_id:
+            raise NotificationUserNotFoundError("User not found")
+
         return Notification(
             id=notification.pk,
-            user_id=user_id,
+            user_id=cast(int | str | uuid.UUID, notification.user_id),
             notification_type=notification.notification_type,
             title=notification.title,
             body_template=notification.body_template,
@@ -180,7 +193,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
                 attachment.notification = notification_instance
                 attachment.save()
 
-        return self.serialize_notification(notification_instance)
+        return self.serialize_user_notification(notification_instance)
 
     def persist_one_off_notification(
         self,
@@ -227,7 +240,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
         ).update(**updated_data)
@@ -238,7 +251,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             )
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
         ).update(status=NotificationStatus.SENT.value)
@@ -246,7 +259,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
         ).update(status=NotificationStatus.FAILED.value)
@@ -254,7 +267,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.SENT.value
         ).update(status=NotificationStatus.READ.value)
@@ -284,10 +297,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             raise NotificationNotFoundError("Notification not found") from e
 
         # Check if it's a one-off notification (no user) or regular notification
-        if notification_instance.user:
-            return self.serialize_notification(notification_instance)
-        else:
-            return self.serialize_one_off_notification(notification_instance)
+        return self.serialize_notification(notification_instance)
 
     def _get_one_off_notification(self, notification_id: int | str | uuid.UUID) -> OneOffNotification:
         """Retrieve one-off notification from storage"""
@@ -315,7 +325,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
         return all_notifications
 
-    def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
+    def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
         return self._serialize_notification_queryset(
             self._paginate_queryset(
                 self._get_all_pending_notifications_queryset(),
@@ -328,7 +338,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         self,
         user_id: int | str | uuid.UUID,
     ) -> Iterable[Notification]:
-        return self._serialize_notification_queryset(
+        return self._serialize_user_notification_queryset(
             self._get_all_in_app_unread_notifications_queryset(user_id),
         )
 
@@ -338,7 +348,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         page: int = 1,
         page_size: int = 10,
     ) -> Iterable[Notification]:
-        return self._serialize_notification_queryset(
+        return self._serialize_user_notification_queryset(
             self._paginate_queryset(
                 self._get_all_in_app_unread_notifications_queryset(user_id),
                 page,
@@ -346,25 +356,25 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             )
         )
 
-    def get_all_future_notifications(self) -> Iterable["Notification"]:
+    def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         return self._serialize_notification_queryset(self._get_all_future_notifications_queryset())
 
-    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
+    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification | OneOffNotification"]:
         return self._serialize_notification_queryset(
             self._paginate_queryset(self._get_all_future_notifications_queryset(), page, page_size)
         )
 
     def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable["Notification"]:
-        return self._serialize_notification_queryset(
+    ) -> Iterable["Notification | OneOffNotification"]:
+        return self._serialize_user_notification_queryset(
             self._get_all_future_notifications_queryset().filter(user_id=str(user_id))
         )
 
     def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable["Notification"]:
-        return self._serialize_notification_queryset(
+    ) -> Iterable["Notification | OneOffNotification"]:
+        return self._serialize_user_notification_queryset(
             self._paginate_queryset(
                 self._get_all_future_notifications_queryset().filter(user_id=str(user_id)),
                 page,
