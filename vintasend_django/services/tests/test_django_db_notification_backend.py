@@ -34,7 +34,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         )
 
         assert isinstance(notification, Notification)
-        assert notification.user_id == self.user.pk
+        assert str(notification.user_id) == str(self.user.pk)
         assert notification.notification_type == NotificationTypes.EMAIL.value
         assert notification.title == "test"
         assert notification.body_template == "test"
@@ -46,7 +46,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         assert notification.status == NotificationStatus.PENDING_SEND.value
         assert notification.id is not None
         notification_db_record = NotificationModel.objects.get(id=notification.id)
-        assert notification_db_record.user_id == self.user.pk
+        assert str(notification_db_record.user_id) == str(self.user.pk)
         assert notification_db_record.notification_type == NotificationTypes.EMAIL.value
         assert notification_db_record.title == "test"
         assert notification_db_record.body_template == "test"
@@ -410,7 +410,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
     def test_get_one_off_notification(self):
         """Test retrieving one-off notification"""
         backend = DjangoDbNotificationBackend()
-        
+
         # Create one-off notification
         one_off_notification = backend.persist_one_off_notification(
             email_or_phone="test@example.com",
@@ -434,7 +434,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
     def test_get_notification_handles_both_types(self):
         """Test that get_notification works for both regular and one-off notifications"""
         backend = DjangoDbNotificationBackend()
-        
+
         # Create regular notification
         regular_notification = backend.persist_notification(
             user_id=self.user.pk,
@@ -470,7 +470,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
     def test_get_all_pending_notifications_includes_one_off(self):
         """Test that get_all_pending_notifications returns both types"""
         backend = DjangoDbNotificationBackend()
-        
+
         # Create regular notification
         regular_notification = backend.persist_notification(
             user_id=self.user.pk,
@@ -496,10 +496,10 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
 
         # Get all pending notifications
         all_pending = list(backend.get_all_pending_notifications())
-        
+
         # Should contain both notifications
         assert len(all_pending) >= 2
-        
+
         # Check that we have both types
         regular_found = False
         one_off_found = False
@@ -508,6 +508,6 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
                 regular_found = True
             elif isinstance(notification, OneOffNotification) and notification.id == one_off_notification.id:
                 one_off_found = True
-        
+
         assert regular_found, "Regular notification not found in pending notifications"
         assert one_off_found, "One-off notification not found in pending notifications"
