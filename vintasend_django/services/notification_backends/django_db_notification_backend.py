@@ -1,8 +1,10 @@
 import datetime
+import os
 import uuid
 from collections.abc import Iterable
 from typing import cast
 
+from django.core.files.base import ContentFile
 from django.db.models import Q, QuerySet
 
 from vintasend.constants import NotificationStatus, NotificationTypes
@@ -122,7 +124,6 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
     def _store_attachments(self, attachments: list[NotificationAttachment]) -> list:
         """Store attachments and return stored attachment objects"""
-        import os
         stored_attachments = []
 
         for attachment in attachments:
@@ -148,7 +149,6 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             )
 
             # Save file content to storage
-            from django.core.files.base import ContentFile
             attachment_instance.file.save(
                 file_name,
                 ContentFile(file_content),
