@@ -27,7 +27,12 @@ class DjangoAttachmentFile(AttachmentFile):
         return self.attachment.file.read()
 
     def stream(self) -> BinaryIO:
-        """Return stream for large files"""
+        """
+        Return a new file stream for large files.
+
+        Each call to this method opens a new file handle. 
+        The caller is responsible for closing the returned stream to prevent resource leaks.
+        """
         return self.attachment.file.open('rb')
 
     def url(self, expires_in: int = 3600) -> str:
