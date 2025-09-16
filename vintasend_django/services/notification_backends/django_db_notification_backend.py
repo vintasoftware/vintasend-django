@@ -93,13 +93,16 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         )
 
     def _serialize_attachment(self, attachment) -> StoredAttachment:
-        """Convert Django attachment model to StoredAttachment"""
+        """
+        Convert Django attachment model to StoredAttachment.
+
+        Note: Checksum is not provided. If needed, implement checksum calculation.
+        """
         return StoredAttachment(
             id=str(attachment.pk),
             filename=attachment.name,
             content_type=attachment.mime_type,
             size=attachment.size or 0,
-            checksum="",  # Could be calculated if needed
             created_at=attachment.created,
             file=DjangoAttachmentFile(attachment),
         )
