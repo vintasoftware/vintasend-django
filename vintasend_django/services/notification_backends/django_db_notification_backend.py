@@ -149,12 +149,24 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             file_name = 'attachment'
             mime_type = 'application/octet-stream'
 
-            # This is a simplified implementation - in a real scenario,
-            # we'd need to handle different attachment types properly
+            # Handle different attachment types
             if hasattr(attachment, 'file_path'):
                 with open(attachment.file_path, 'rb') as f:
                     file_content = f.read()
                 file_name = os.path.basename(attachment.file_path)
+            elif hasattr(attachment, 'file_bytes'):
+                file_content = attachment.file_bytes
+                file_name = getattr(attachment, 'file_name', 'attachment')
+            elif hasattr(attachment, 'file_obj'):
+                file_obj = attachment.file_obj
+                file_obj.seek(0)
+                file_content = file_obj.read()
+                file_name = getattr(attachment, 'file_name', 'attachment')
+            else:
+                raise ValueError(
+                    f"Unsupported attachment type: {type(attachment)}. "
+                    "Attachment must have 'file_path', 'file_bytes', or 'file_obj'."
+                )
 
             # Create attachment record in database
             attachment_instance = AttachmentModel(
