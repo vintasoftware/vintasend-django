@@ -126,7 +126,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             except OSError:
                 # If file reading fails, use empty checksum
                 checksum = ""
-        
+
         return StoredAttachment(
             id=str(attachment.pk),
             filename=attachment.name,
