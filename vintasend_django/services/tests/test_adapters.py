@@ -1,14 +1,15 @@
 import uuid
-import pytest
 
 from django.core import mail
 
+import pytest
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationTemplateRenderingError,
 )
-from vintasend.services.dataclasses import Notification
+from vintasend.services.dataclasses import Notification, OneOffNotification
 from vintasend.services.notification_backends.stubs.fake_backend import FakeFileBackend
+
 from vintasend_django.services.notification_adapters.django_email import (
     DjangoEmailNotificationAdapter,
 )
@@ -80,3 +81,56 @@ class DjangoEmailNotificationAdapterTestCase(VintaSendDjangoTestCase):
             adapter.send(notification, context)
 
         assert len(mail.outbox) == 0
+
+    def test_send_one_off_notification(self):
+        """Test sending one-off notification"""
+        one_off_notification = OneOffNotification(
+            id=uuid.uuid4(),
+            email_or_phone="oneoff@example.com",
+            first_name="John",
+            last_name="Doe",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="One-off Test Notification",
+            body_template="Test Body",
+            context_name="test_context",
+            context_kwargs={"test": "test"},
+            send_after=None,
+            subject_template="Test Subject",
+            preheader_template="Test Preheader",
+            status=NotificationStatus.PENDING_SEND.value,
+            attachments=[],
+        )
+        context = self.create_notification_context()
+
+        adapter = DjangoEmailNotificationAdapter(
+            "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+            "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
+            backend_kwargs={"database_file_name": "django-email-adapter-test-one-off.json"},
+        )
+
+        adapter.send(one_off_notification, context)
+
+        assert len(mail.outbox) == 1
+        email = mail.outbox[0]
+        assert email.subject == one_off_notification.subject_template
+        assert email.body == one_off_notification.body_template
+        assert email.to == ["oneoff@example.com"]
+
+    def create_one_off_notification(self):
+        """Helper method to create one-off notification for testing"""
+        return OneOffNotification(
+            id=uuid.uuid4(),
+            email_or_phone="oneoff@example.com",
+            first_name="Test",
+            last_name="User",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-off Notification",
+            body_template="Test Body",
+            context_name="test_context",
+            context_kwargs={"test": "test"},
+            send_after=None,
+            subject_template="Test Subject",
+            preheader_template="Test Preheader",
+            status=NotificationStatus.PENDING_SEND.value,
+            attachments=[],
+        )

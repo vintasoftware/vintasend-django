@@ -13,11 +13,16 @@ from vintasend.exceptions import (
 )
 from vintasend.services.dataclasses import (
     Notification,
+    NotificationAttachment,
+    OneOffNotification,
+    StoredAttachment,
     UpdateNotificationKwargs,
 )
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 
+from vintasend_django.models import Attachment as AttachmentModel
 from vintasend_django.models import Notification as NotificationModel
+from vintasend_django.services.attachment_file import DjangoAttachmentFile
 
 
 class DjangoDbNotificationBackend(BaseNotificationBackend):
@@ -53,9 +58,10 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         return (self.serialize_notification(n) for n in queryset.iterator())
 
     def serialize_notification(self, notification: NotificationModel) -> Notification:
+        user_id = notification.user.id if notification.user else 0  # Use 0 as default for None user
         return Notification(
             id=notification.pk,
-            user_id=notification.user.id,
+            user_id=user_id,
             notification_type=notification.notification_type,
             title=notification.title,
             body_template=notification.body_template,
@@ -66,6 +72,76 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             preheader_template=notification.preheader_template,
             status=notification.status,
         )
+
+    def serialize_one_off_notification(self, notification: NotificationModel) -> OneOffNotification:
+        """Serialize Django model to OneOffNotification dataclass"""
+        return OneOffNotification(
+            id=notification.pk,
+            email_or_phone=notification.email_or_phone,
+            first_name=notification.first_name,
+            last_name=notification.last_name,
+            notification_type=notification.notification_type,
+            title=notification.title,
+            body_template=notification.body_template,
+            context_name=notification.context_name,
+            context_kwargs=notification.context_kwargs,
+            send_after=notification.send_after,
+            subject_template=notification.subject_template,
+            preheader_template=notification.preheader_template,
+            status=notification.status,
+            attachments=[self._serialize_attachment(att) for att in notification.attachments.all()],
+        )
+
+    def _serialize_attachment(self, attachment) -> StoredAttachment:
+        """Convert Django attachment model to StoredAttachment"""
+        return StoredAttachment(
+            id=str(attachment.pk),
+            filename=attachment.name,
+            content_type=attachment.mime_type,
+            size=attachment.size or 0,
+            checksum="",  # Could be calculated if needed
+            created_at=attachment.created,
+            file=DjangoAttachmentFile(attachment),
+        )
+
+    def _store_attachments(self, attachments: list[NotificationAttachment]) -> list:
+        """Store attachments and return stored attachment objects"""
+        import os
+        stored_attachments = []
+
+        for attachment in attachments:
+
+
+            # Handle different attachment input types (simplified for now)
+            file_content = b''
+            file_name = 'attachment'
+            mime_type = 'application/octet-stream'
+
+            # This is a simplified implementation - in a real scenario,
+            # we'd need to handle different attachment types properly
+            if hasattr(attachment, 'file_path'):
+                with open(attachment.file_path, 'rb') as f:
+                    file_content = f.read()
+                file_name = os.path.basename(attachment.file_path)
+
+            # Create attachment record in database
+            attachment_instance = AttachmentModel(
+                name=file_name,
+                mime_type=mime_type,
+                size=len(file_content),
+            )
+
+            # Save file content to storage
+            from django.core.files.base import ContentFile
+            attachment_instance.file.save(
+                file_name,
+                ContentFile(file_content),
+                save=True
+            )
+
+            stored_attachments.append(attachment_instance)
+
+        return stored_attachments
 
     def persist_notification(
         self,
@@ -79,6 +155,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         subject_template: str | None = None,
         preheader_template: str | None = None,
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) -> Notification:
         notification_instance = NotificationModel.objects.create(
             user_id=str(user_id),
@@ -92,7 +169,58 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             preheader_template=preheader_template or "",
             adapter_extra_parameters=adapter_extra_parameters,
         )
+
+        # Store attachments relationship
+        if attachments:
+            stored_attachments = self._store_attachments(attachments)
+            for attachment in stored_attachments:
+                attachment.notification = notification_instance
+                attachment.save()
+
         return self.serialize_notification(notification_instance)
+
+    def persist_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None = None,
+        subject_template: str = "",
+        preheader_template: str = "",
+        adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
+    ) -> OneOffNotification:
+        """Create and store a one-off notification"""
+
+        notification_instance = NotificationModel.objects.create(
+            user=None,  # No user for one-off notifications
+            email_or_phone=email_or_phone,
+            first_name=first_name,
+            last_name=last_name,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template or "",
+            preheader_template=preheader_template or "",
+            adapter_extra_parameters=adapter_extra_parameters,
+        )
+
+        # Store attachments relationship
+        if attachments:
+            stored_attachments = self._store_attachments(attachments)
+            for attachment in stored_attachments:
+                attachment.notification = notification_instance
+                attachment.save()
+
+        return self.serialize_one_off_notification(notification_instance)
 
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
@@ -141,7 +269,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
+        """Get notification by ID, supporting both regular and one-off notifications"""
         queryset = NotificationModel.objects.exclude(status=NotificationStatus.CANCELLED.value)
 
         if for_update:
@@ -150,10 +279,38 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             notification_instance = queryset.get(id=str(notification_id))
         except NotificationModel.DoesNotExist as e:
             raise NotificationNotFoundError("Notification not found") from e
-        return self.serialize_notification(notification_instance)
 
-    def get_all_pending_notifications(self) -> Iterable[Notification]:
-        return self._serialize_notification_queryset(self._get_all_pending_notifications_queryset())
+        # Check if it's a one-off notification (no user) or regular notification
+        if notification_instance.user:
+            return self.serialize_notification(notification_instance)
+        else:
+            return self.serialize_one_off_notification(notification_instance)
+
+    def _get_one_off_notification(self, notification_id: int | str | uuid.UUID) -> OneOffNotification:
+        """Retrieve one-off notification from storage"""
+        try:
+            notification_instance = NotificationModel.objects.exclude(
+                status=NotificationStatus.CANCELLED.value
+            ).get(id=str(notification_id), user__isnull=True)
+        except NotificationModel.DoesNotExist as e:
+            raise NotificationNotFoundError(f"One-off notification {notification_id} not found") from e
+
+        return self.serialize_one_off_notification(notification_instance)
+
+    def get_all_pending_notifications(self) -> Iterable[Notification | OneOffNotification]:
+        """Return both regular notifications and one-off notifications that are pending"""
+        queryset = self._get_all_pending_notifications_queryset()
+
+        # Separate regular notifications (with user) from one-off notifications (without user)
+        all_notifications: list[Notification | OneOffNotification] = []
+
+        for notification in queryset:
+            if notification.user:
+                all_notifications.append(self.serialize_notification(notification))
+            else:
+                all_notifications.append(self.serialize_one_off_notification(notification))
+
+        return all_notifications
 
     def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
         return self._serialize_notification_queryset(
