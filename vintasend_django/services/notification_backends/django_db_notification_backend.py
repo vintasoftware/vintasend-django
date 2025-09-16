@@ -152,7 +152,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             attachment_instance.file.save(
                 file_name,
                 ContentFile(file_content),
-                save=True
+                save=False  # Don't save the model instance yet
             )
 
             stored_attachments.append(attachment_instance)
