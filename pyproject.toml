@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "vintasend-django"
-version = "0.1.4"
+version = "1.0.1"
 description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
@@ -13,7 +13,7 @@ include = [
 [tool.poetry.dependencies]
 python = "<3.14,>=3.10"
 django = "<5.3,>=3.2"
-vintasend = "1.0.0"
+vintasend = "1.0.1"
 django-model-utils = "^5.0.0"
 
 
