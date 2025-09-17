@@ -1,5 +1,10 @@
 # Release Notes
 
+## Version 1.0.1 (2025-09-16)
+
+* Bump vintasend version to 1.0.1
+
+
 ## Version 1.0.0 (2025-09-16)
 
 ### 🚀 Major Features
