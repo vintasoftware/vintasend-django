@@ -1,5 +1,11 @@
 # Release Notes
 
+## Version 1.1.1 (2026-06-03)
+
+* Bump vintasend to 1.1.1
+* Add Python 3.14 support (Django 6.0)
+
+
 ## Version 1.1.0 (2026-06-03)
 
 * Bump vintasend to 1.1.0
