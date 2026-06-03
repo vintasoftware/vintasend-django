@@ -1,4 +1,4 @@
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 from vintasend.services.dataclasses import AttachmentFile
 
@@ -33,7 +33,9 @@ class DjangoAttachmentFile(AttachmentFile):
         Each call to this method opens a new file handle. 
         The caller is responsible for closing the returned stream to prevent resource leaks.
         """
-        return self.attachment.file.open('rb')
+        # FieldFile.open() returns the FieldFile itself, which is file-like;
+        # django-stubs 6 no longer types it as BinaryIO, so cast explicitly.
+        return cast(BinaryIO, self.attachment.file.open('rb'))
 
     def url(self, expires_in: int = 3600) -> str:
         """Generate temporary URL if supported"""
