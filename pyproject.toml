@@ -11,22 +11,22 @@ include = [
 ]
 
 [tool.poetry.dependencies]
-python = "<3.14,>=3.10"
-django = "<5.3,>=3.2"
-vintasend = "1.0.1"
+python = "<3.14,>=3.12"
+django = "<6.1,>=4.2"
+vintasend = "1.1.0"
 django-model-utils = "^5.0.0"
 
 
 [tool.poetry.group.dev.dependencies]
 freezegun = "^1.5.1"
-coverage = "^7.6.4"
-django-stubs = {version = "^5.1.1", extras=["compatible-mypy"]}
-tox = "^4.23.2"
-pytest = "^8.3.3"
+coverage = "^7.14.1"
+django-stubs = {version = "^6.0.5", extras=["compatible-mypy"]}
+tox = "^4.55.0"
+pytest = "^9.0.3"
 pytest-xdist = {version = "^3.6.1", extras=["psutil"]}
-pytest-cov = "^6.0.0"
-pytest-django = "^4.9.0"
-model-bakery = "^1.20.0"
+pytest-cov = "^7.1.0"
+pytest-django = "^4.12.0"
+model-bakery = "^1.23.4"
 
 [build-system]
 requires = ["poetry-core"]
