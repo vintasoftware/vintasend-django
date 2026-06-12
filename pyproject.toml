@@ -13,7 +13,7 @@ include = [
 [tool.poetry.dependencies]
 python = "<3.15,>=3.12"
 django = "<6.1,>=4.2"
-vintasend = "1.1.1"
+vintasend = "1.1.2"
 django-model-utils = "^5.0.0"
 
 

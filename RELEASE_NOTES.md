@@ -1,5 +1,9 @@
 # Release Notes
 
+## Version 1.1.2 (2026-06-12)
+
+* Bump vintasend to 1.1.2
+
 ## Version 1.1.1 (2026-06-03)
 
 * Bump vintasend to 1.1.1
