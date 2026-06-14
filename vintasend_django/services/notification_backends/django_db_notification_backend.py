@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import cast
 
 from django.core.files.base import ContentFile
+from django.db import transaction
 from django.db.models import Q, QuerySet
 
 from vintasend.constants import NotificationStatus, NotificationTypes
@@ -42,8 +43,22 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         return NotificationModel.objects.filter(
             user_id=str(user_id),
             status=NotificationStatus.SENT.value,
-            notification_type=NotificationTypes.IN_APP,
-        ).order_by("created")
+            notification_type=NotificationTypes.IN_APP.value,
+        ).order_by("-created", "-id")
+
+    def _get_all_in_app_notifications_queryset(
+        self, user_id: int | str | uuid.UUID
+    ) -> QuerySet["NotificationModel"]:
+        """Read + unread in-app notifications (SENT or READ), newest-first.
+
+        Excludes internal pipeline states (PENDING_SEND, FAILED, CANCELLED) so
+        they are never exposed to end users.
+        """
+        return NotificationModel.objects.filter(
+            user_id=str(user_id),
+            notification_type=NotificationTypes.IN_APP.value,
+            status__in=[NotificationStatus.SENT.value, NotificationStatus.READ.value],
+        ).order_by("-created", "-id")
 
     def _get_all_pending_notifications_queryset(self) -> QuerySet["NotificationModel"]:
         return NotificationModel.objects.filter(
@@ -87,6 +102,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             subject_template=notification.subject_template,
             preheader_template=notification.preheader_template,
             status=notification.status,
+            context_used=notification.context_used,
+            adapter_used=notification.adapter_used or None,
+            adapter_extra_parameters=notification.adapter_extra_parameters,
+            created=notification.created,
+            modified=notification.modified,
         )
 
     def serialize_one_off_notification(self, notification: NotificationModel) -> OneOffNotification:
@@ -105,6 +125,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             subject_template=notification.subject_template,
             preheader_template=notification.preheader_template,
             status=notification.status,
+            context_used=notification.context_used,
+            adapter_used=notification.adapter_used or None,
+            adapter_extra_parameters=notification.adapter_extra_parameters,
+            created=notification.created,
+            modified=notification.modified,
             attachments=[self._serialize_attachment(att) for att in notification.attachments.all()],
         )
 
@@ -382,6 +407,66 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
                 page_size,
             )
         )
+
+    def filter_all_in_app_notifications(
+        self,
+        user_id: int | str | uuid.UUID,
+    ) -> Iterable[Notification]:
+        """Unpaginated read + unread in-app notifications.
+
+        Prefer :meth:`filter_in_app_notifications` (paginated) plus
+        :meth:`count_in_app_notifications` for end-user listings.
+        """
+        return self._serialize_user_notification_queryset(
+            self._get_all_in_app_notifications_queryset(user_id),
+        )
+
+    def filter_in_app_notifications(
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Iterable[Notification]:
+        return self._serialize_user_notification_queryset(
+            self._paginate_queryset(
+                self._get_all_in_app_notifications_queryset(user_id),
+                page,
+                page_size,
+            )
+        )
+
+    def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
+        return self._get_all_in_app_notifications_queryset(user_id).count()
+
+    def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
+        return self._get_all_in_app_unread_notifications_queryset(user_id).count()
+
+    def mark_sent_as_read_bulk(
+        self,
+        notification_ids: Iterable[int | str | uuid.UUID],
+        user_id: int | str | uuid.UUID | None = None,
+    ) -> Iterable[Notification]:
+        """Mark every SENT notification in ``notification_ids`` as READ.
+
+        Idempotent: ids that are already READ, missing, not owned (when
+        ``user_id`` is given), or in a non-SENT state are simply skipped and
+        never raise. When ``user_id`` is provided the update is scoped to that
+        user so rows owned by others are never touched (recommended for
+        endpoints). Returns the serialized notifications for the requested ids
+        that are READ after the operation (newly-marked + already-read).
+        """
+        ids = [str(i) for i in notification_ids]
+        base = NotificationModel.objects.filter(id__in=ids)
+        if user_id is not None:
+            base = base.filter(user_id=str(user_id))
+
+        with transaction.atomic():
+            base.filter(status=NotificationStatus.SENT.value).update(
+                status=NotificationStatus.READ.value
+            )
+
+        read_qs = base.filter(status=NotificationStatus.READ.value).order_by("-created", "-id")
+        return self._serialize_user_notification_queryset(read_qs)
 
     def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         return self._serialize_notification_queryset(self._get_all_future_notifications_queryset())

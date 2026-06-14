@@ -333,6 +333,153 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         notification_db_record = NotificationModel.objects.get(id=notification.id)
         assert notification_db_record.status == NotificationStatus.READ.value
 
+    def _make_notification(self, user, status, notification_type=NotificationTypes.IN_APP):
+        return NotificationModel.objects.create(
+            user=user,
+            notification_type=notification_type.value,
+            title="test",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            status=status.value,
+        )
+
+    def test_filter_in_app_unread_notifications_returns_sent_in_app(self):
+        # Regression test for the NotificationTypes.IN_APP (missing .value) bug:
+        # a SENT IN_APP notification must be returned by the unread filter.
+        notification = self._make_notification(self.user, NotificationStatus.SENT)
+
+        results = list(
+            DjangoDbNotificationBackend().filter_in_app_unread_notifications(self.user.pk)
+        )
+
+        assert [n.id for n in results] == [notification.pk]
+
+    def test_filter_in_app_notifications_returns_sent_and_read_excludes_others(self):
+        sent = self._make_notification(self.user, NotificationStatus.SENT)
+        read = self._make_notification(self.user, NotificationStatus.READ)
+        # Excluded internal pipeline states
+        self._make_notification(self.user, NotificationStatus.PENDING_SEND)
+        self._make_notification(self.user, NotificationStatus.FAILED)
+        self._make_notification(self.user, NotificationStatus.CANCELLED)
+        # Excluded: non-IN_APP
+        self._make_notification(
+            self.user, NotificationStatus.SENT, notification_type=NotificationTypes.EMAIL
+        )
+
+        results = list(DjangoDbNotificationBackend().filter_in_app_notifications(self.user.pk))
+
+        # newest-first ("-created", "-id"); read was created after sent
+        assert [n.id for n in results] == [read.pk, sent.pk]
+
+    def test_filter_in_app_notifications_scoped_per_user(self):
+        mine = self._make_notification(self.user, NotificationStatus.SENT)
+        other = self.create_user(email="other@example.com")
+        self._make_notification(other, NotificationStatus.SENT)
+
+        results = list(DjangoDbNotificationBackend().filter_in_app_notifications(self.user.pk))
+
+        assert [n.id for n in results] == [mine.pk]
+
+    def test_filter_in_app_notifications_pagination(self):
+        created = [self._make_notification(self.user, NotificationStatus.SENT) for _ in range(5)]
+        # newest-first
+        expected_order = list(reversed(created))
+
+        backend = DjangoDbNotificationBackend()
+        page1 = list(backend.filter_in_app_notifications(self.user.pk, page=1, page_size=2))
+        page2 = list(backend.filter_in_app_notifications(self.user.pk, page=2, page_size=2))
+        page3 = list(backend.filter_in_app_notifications(self.user.pk, page=3, page_size=2))
+
+        assert [n.id for n in page1] == [n.pk for n in expected_order[0:2]]
+        assert [n.id for n in page2] == [n.pk for n in expected_order[2:4]]
+        assert [n.id for n in page3] == [n.pk for n in expected_order[4:5]]
+
+    def test_count_in_app_notifications(self):
+        self._make_notification(self.user, NotificationStatus.SENT)
+        self._make_notification(self.user, NotificationStatus.READ)
+        self._make_notification(self.user, NotificationStatus.PENDING_SEND)
+        self._make_notification(
+            self.user, NotificationStatus.SENT, notification_type=NotificationTypes.EMAIL
+        )
+
+        assert DjangoDbNotificationBackend().count_in_app_notifications(self.user.pk) == 2
+
+    def test_count_in_app_unread_notifications(self):
+        self._make_notification(self.user, NotificationStatus.SENT)
+        self._make_notification(self.user, NotificationStatus.SENT)
+        self._make_notification(self.user, NotificationStatus.READ)
+
+        assert DjangoDbNotificationBackend().count_in_app_unread_notifications(self.user.pk) == 2
+
+    def test_mark_sent_as_read_bulk_marks_and_returns_final_state(self):
+        sent_a = self._make_notification(self.user, NotificationStatus.SENT)
+        sent_b = self._make_notification(self.user, NotificationStatus.SENT)
+        already_read = self._make_notification(self.user, NotificationStatus.READ)
+
+        results = list(
+            DjangoDbNotificationBackend().mark_sent_as_read_bulk(
+                [sent_a.pk, sent_b.pk, already_read.pk], user_id=self.user.pk
+            )
+        )
+
+        assert {n.id for n in results} == {sent_a.pk, sent_b.pk, already_read.pk}
+        assert all(n.status == NotificationStatus.READ.value for n in results)
+        for n in (sent_a, sent_b, already_read):
+            n.refresh_from_db()
+            assert n.status == NotificationStatus.READ.value
+
+    def test_mark_sent_as_read_bulk_idempotent_on_already_read(self):
+        already_read = self._make_notification(self.user, NotificationStatus.READ)
+
+        # Must not raise (single mark_sent_as_read would).
+        results = list(
+            DjangoDbNotificationBackend().mark_sent_as_read_bulk([already_read.pk])
+        )
+
+        assert [n.id for n in results] == [already_read.pk]
+
+    def test_mark_sent_as_read_bulk_skips_missing_and_non_sent(self):
+        sent = self._make_notification(self.user, NotificationStatus.SENT)
+        pending = self._make_notification(self.user, NotificationStatus.PENDING_SEND)
+
+        results = list(
+            DjangoDbNotificationBackend().mark_sent_as_read_bulk(
+                [sent.pk, pending.pk, 99999], user_id=self.user.pk
+            )
+        )
+
+        assert [n.id for n in results] == [sent.pk]
+        pending.refresh_from_db()
+        assert pending.status == NotificationStatus.PENDING_SEND.value
+
+    def test_mark_sent_as_read_bulk_respects_user_scoping(self):
+        other = self.create_user(email="other@example.com")
+        mine = self._make_notification(self.user, NotificationStatus.SENT)
+        theirs = self._make_notification(other, NotificationStatus.SENT)
+
+        results = list(
+            DjangoDbNotificationBackend().mark_sent_as_read_bulk(
+                [mine.pk, theirs.pk], user_id=self.user.pk
+            )
+        )
+
+        assert [n.id for n in results] == [mine.pk]
+        theirs.refresh_from_db()
+        assert theirs.status == NotificationStatus.SENT.value
+
+    def test_serialize_user_notification_carries_timestamps_and_context(self):
+        record = self._make_notification(self.user, NotificationStatus.SENT)
+        record.context_used = {"foo": "bar"}
+        record.save()
+
+        serialized = DjangoDbNotificationBackend().serialize_user_notification(record)
+
+        assert serialized.context_used == {"foo": "bar"}
+        assert serialized.created == record.created
+        assert serialized.modified == record.modified
+
     def test_cancel_notification(self):
         notification = DjangoDbNotificationBackend().persist_notification(
             user_id=self.user.pk,
