@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
@@ -25,16 +26,16 @@ class Notification(models.Model):
     subject_template = models.CharField(max_length=255, blank=True)
     preheader_template = models.CharField(max_length=255, blank=True)
     context_name = models.CharField(max_length=255, blank=True)
-    context_kwargs = models.JSONField(default=dict)
+    context_kwargs = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
 
     send_after = models.DateTimeField(null=True)
 
     created = AutoCreatedField(_("created"), db_index=True)
     modified = AutoLastModifiedField(_("modified"), db_index=True)
 
-    adapter_extra_parameters = models.JSONField(_("extra parameters for the notification adapter"), null=True)
+    adapter_extra_parameters = models.JSONField(_("extra parameters for the notification adapter"), null=True, encoder=DjangoJSONEncoder)
 
-    context_used = models.JSONField(_("context used when notification was sent"), null=True)
+    context_used = models.JSONField(_("context used when notification was sent"), null=True, encoder=DjangoJSONEncoder)
     adapter_used = models.CharField(_("adapter used to send the notification"), max_length=255, blank=True)
 
     objects: models.Manager["Notification"]
