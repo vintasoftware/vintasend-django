@@ -39,15 +39,16 @@ class DjangoTemplatedEmailRenderer(BaseTemplatedEmailRenderer):
                 'recipient_full_name': f"{notification.first_name} {notification.last_name}".strip(),
             })
 
-        try:
-            enhanced_context["private_preheader"] = render_to_string(
-                preheader_template,
-                enhanced_context,
-            )
-        except Exception as e:  # noqa: BLE001
-            raise NotificationPreheaderTemplateRenderingError(
-                "Failed to render preheader template"
-            ) from e
+        if preheader_template:
+            try:
+                enhanced_context["private_preheader"] = render_to_string(
+                    preheader_template,
+                    enhanced_context,
+                )
+            except Exception as e:  # noqa: BLE001
+                raise NotificationPreheaderTemplateRenderingError(
+                    "Failed to render preheader template"
+                ) from e
 
         try:
             subject = render_to_string(subject_template, enhanced_context)
