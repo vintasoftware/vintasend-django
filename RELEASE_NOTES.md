@@ -1,6 +1,28 @@
 # Release Notes
 
 
+## Version 1.2.1 (2026-06-16)
+
+### Bugfix
+
+* Fixed `TypeError: Object of type datetime is not JSON serializable` when storing render
+  context: `context_used`, `context_kwargs`, and `adapter_extra_parameters` now use
+  `DjangoJSONEncoder`, which serializes `datetime`/`date`/`Decimal`/`UUID` to JSON. Note that
+  these values round-trip back as ISO strings, not native objects.
+* `DjangoTemplatedEmailRenderer` no longer raises `NotificationPreheaderTemplateRenderingError`
+  when `preheader_template` is empty — the preheader render is now skipped entirely for
+  notifications without a preheader template.
+
+### Migrations
+
+* `0003_alter_notification_adapter_extra_parameters_and_more` — alters the `encoder` on the three
+  `JSONField`s. No-op at the database level; run `migrate` to keep Django's migration state in sync.
+
+### Backwards compatibility
+
+* No method signature or semantic change. Existing rows are unaffected.
+
+
 ## Version 1.2.0 (2026-06-14)
 
 ### Bugfix

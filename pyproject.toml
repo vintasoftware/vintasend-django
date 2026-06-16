@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "vintasend-django"
-version = "1.2.0"
+version = "1.2.1"
 description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
