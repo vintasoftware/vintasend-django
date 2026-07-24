@@ -1,23 +1,29 @@
-import hashlib
-import os
 import random
+import shutil
 import tempfile
 from datetime import timedelta
-from unittest.mock import Mock
 
+from django.test import override_settings
 from django.utils import timezone
 
 import pytest
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
+    AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
     NotificationUpdateError,
 )
-from vintasend.services.dataclasses import Notification, NotificationAttachment, OneOffNotification
+from vintasend.services.dataclasses import (
+    Notification,
+    NotificationAttachment,
+    NotificationAttachmentReference,
+    OneOffNotification,
+)
 
-from vintasend_django.models import Attachment as AttachmentModel
+from vintasend_django.models import AttachmentFileRecord as AttachmentFileRecordModel
 from vintasend_django.models import Notification as NotificationModel
+from vintasend_django.models import NotificationAttachment as NotificationAttachmentModel
 from vintasend_django.services.notification_backends.django_db_notification_backend import (
     DjangoDbNotificationBackend,
 )
@@ -27,38 +33,27 @@ from vintasend_django.test_helpers import VintaSendDjangoTestCase
 class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
     def setUp(self):
         super().setUp()
-        self.temp_files = []  # Track temporary files created during tests
+        # Point Django's default file storage at a throwaway directory so the
+        # DjangoAttachmentManager writes attachment bytes somewhere isolated per test.
+        self._media_root = tempfile.mkdtemp()
+        self._media_override = override_settings(MEDIA_ROOT=self._media_root)
+        self._media_override.enable()
 
     def tearDown(self):
+        self._media_override.disable()
+        shutil.rmtree(self._media_root, ignore_errors=True)
         super().tearDown()
-        # Clean up temporary files
-        for file_path in self.temp_files:
-            try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-            except OSError:
-                pass  # File might already be deleted
 
-        # Clean up attachment files from Django's file storage
-        # This will clean up files created by attachment tests
-        for attachment in AttachmentModel.objects.all():
-            try:
-                if attachment.file:
-                    attachment.file.delete(save=False)
-            except OSError:
-                pass  # File might already be deleted
-
-        # Additional cleanup: manually remove any remaining files in the attachments directory
-        import glob
-        attachment_dir = "notifications/attachments"
-        if os.path.exists(attachment_dir):
-            # Remove all files in the attachments directory
-            for file_path in glob.glob(os.path.join(attachment_dir, "*")):
-                try:
-                    if os.path.isfile(file_path):
-                        os.unlink(file_path)
-                except OSError:
-                    pass  # File might already be deleted
+    @staticmethod
+    def _attachment(
+        content: bytes = b"attachment content",
+        filename: str = "document.txt",
+        content_type: str | None = "text/plain",
+        **kwargs,
+    ) -> NotificationAttachment:
+        return NotificationAttachment(
+            file=content, filename=filename, content_type=content_type, **kwargs
+        )
 
     def test_persist_notification(self):
         notification = DjangoDbNotificationBackend().persist_notification(
@@ -699,535 +694,631 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         assert regular_found, "Regular notification not found in pending notifications"
         assert one_off_found, "One-off notification not found in pending notifications"
 
-    def test_persist_notification_with_file_path_attachment(self):
-        """Test persisting regular notification with file path attachment"""
-        backend = DjangoDbNotificationBackend()
+    # --------------------------------------------------------------- new 2.0 fields
 
-        # Create a temporary file for testing
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
-            tmp_file.write("Test attachment content")
-            tmp_file_path = tmp_file.name
-
-        # Track temp file for cleanup
-        self.temp_files.append(tmp_file_path)
-
-        # Create mock attachment
-        mock_attachment = Mock(spec=NotificationAttachment)
-        mock_attachment.file_path = tmp_file_path
-
-        notification = backend.persist_notification(
+    def test_mark_pending_as_sent_sets_sent_at(self):
+        notification = DjangoDbNotificationBackend().persist_notification(
             user_id=self.user.pk,
             notification_type=NotificationTypes.EMAIL.value,
-            title="Test with attachment",
+            title="Title",
             body_template="test",
             context_name="test",
             context_kwargs={},
             send_after=None,
-            attachments=[mock_attachment],
+        )
+        sent = DjangoDbNotificationBackend().mark_pending_as_sent(notification.id)
+        assert sent.status == NotificationStatus.SENT.value
+        assert sent.sent_at is not None
+        assert NotificationModel.objects.get(id=notification.id).sent_at is not None
+
+    def test_mark_sent_as_read_sets_read_at(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.IN_APP.value,
+            title="Title",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        backend.mark_pending_as_sent(notification.id)
+        read = backend.mark_sent_as_read(notification.id)
+        assert read.status == NotificationStatus.READ.value
+        assert read.read_at is not None
+
+    def test_mark_sent_as_read_bulk_sets_read_at(self):
+        backend = DjangoDbNotificationBackend()
+        notifications = []
+        for _ in range(2):
+            n = backend.persist_notification(
+                user_id=self.user.pk,
+                notification_type=NotificationTypes.IN_APP.value,
+                title="Bulk",
+                body_template="test",
+                context_name="test",
+                context_kwargs={},
+                send_after=None,
+            )
+            backend.mark_pending_as_sent(n.id)
+            notifications.append(n)
+
+        result = list(
+            backend.mark_sent_as_read_bulk([n.id for n in notifications], user_id=self.user.pk)
+        )
+        assert len(result) == 2
+        assert all(n.read_at is not None for n in result)
+
+    def test_persist_notification_with_tenant(self):
+        notification = DjangoDbNotificationBackend().persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Tenant title",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            tenant="acme",
+        )
+        assert notification.tenant == "acme"
+        assert NotificationModel.objects.get(id=notification.id).tenant == "acme"
+
+    def test_store_git_commit_sha(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Sha title",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        sha = "a" * 40
+        backend.store_git_commit_sha(notification.id, sha)
+        reloaded = backend.get_notification(notification.id)
+        assert reloaded.git_commit_sha == sha
+
+    # --------------------------------------------------------------- attachments
+
+    def test_persist_notification_with_attachment(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="With attachment",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"hello world", filename="hello.txt")],
         )
 
-        assert isinstance(notification, Notification)
-        assert notification.user_id == str(self.user.pk)
+        assert len(notification.attachments) == 1
+        stored = notification.attachments[0]
+        assert stored.filename == "hello.txt"
+        assert stored.content_type == "text/plain"
+        assert stored.size == len(b"hello world")
+        assert stored.file.read() == b"hello world"
+        assert AttachmentFileRecordModel.objects.count() == 1
+        assert NotificationAttachmentModel.objects.filter(
+            notification_id=notification.id
+        ).count() == 1
 
-        # Verify attachment was stored
-        notification_db_record = NotificationModel.objects.get(id=notification.id)
-        attachments = notification_db_record.attachments.all()
-        assert len(attachments) == 1
-
-        attachment = attachments[0]
-        assert attachment.name == os.path.basename(tmp_file_path)
-        assert attachment.mime_type == 'application/octet-stream'
-        assert attachment.size > 0
-        assert attachment.file  # File should be saved
-
-    def test_persist_one_off_notification_with_file_path_attachment(self):
-        """Test persisting one-off notification with file path attachment"""
+    def test_persist_one_off_notification_with_attachment(self):
         backend = DjangoDbNotificationBackend()
-
-        # Create a temporary file for testing
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
-            tmp_file.write("Test one-off attachment content")
-            tmp_file_path = tmp_file.name
-
-        # Track temp file for cleanup
-        self.temp_files.append(tmp_file_path)
-
-        # Create mock attachment
-        mock_attachment = Mock(spec=NotificationAttachment)
-        mock_attachment.file_path = tmp_file_path
-
-        one_off_notification = backend.persist_one_off_notification(
-            email_or_phone="test@example.com",
-            first_name="John",
-            last_name="Doe",
+        notification = backend.persist_one_off_notification(
+            email_or_phone="user@example.com",
+            first_name="A",
+            last_name="B",
             notification_type=NotificationTypes.EMAIL.value,
             title="One-off with attachment",
             body_template="test",
             context_name="test",
             context_kwargs={},
-            attachments=[mock_attachment],
+            attachments=[self._attachment(content=b"one off bytes", filename="oo.txt")],
         )
+        assert len(notification.attachments) == 1
+        assert notification.attachments[0].file.read() == b"one off bytes"
 
-        assert isinstance(one_off_notification, OneOffNotification)
-        assert one_off_notification.email_or_phone == "test@example.com"
+    def test_identical_attachments_are_deduplicated_on_checksum(self):
+        backend = DjangoDbNotificationBackend()
+        backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="First",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"same bytes", filename="a.txt")],
+        )
+        backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Second",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"same bytes", filename="a.txt")],
+        )
+        # One shared file record, two join rows.
+        assert AttachmentFileRecordModel.objects.count() == 1
+        assert NotificationAttachmentModel.objects.count() == 2
 
-        # Verify attachment was stored
-        notification_db_record = NotificationModel.objects.get(id=one_off_notification.id)
-        attachments = notification_db_record.attachments.all()
+    def test_attach_by_reference_reuses_existing_file(self):
+        backend = DjangoDbNotificationBackend()
+        first = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Owner",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"referenced", filename="ref.txt")],
+        )
+        file_id = first.attachments[0].file_id
+        assert file_id
+
+        second = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Referencer",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[NotificationAttachmentReference(file_id=file_id)],
+        )
+        assert second.attachments[0].file_id == file_id
+        assert AttachmentFileRecordModel.objects.count() == 1
+        assert NotificationAttachmentModel.objects.count() == 2
+
+    def test_attach_by_unknown_reference_raises(self):
+        backend = DjangoDbNotificationBackend()
+        with pytest.raises(AttachmentFileNotFoundError):
+            backend.persist_notification(
+                user_id=self.user.pk,
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Bad ref",
+                body_template="test",
+                context_name="test",
+                context_kwargs={},
+                send_after=None,
+                attachments=[NotificationAttachmentReference(file_id="999999")],
+            )
+
+    def test_get_attachments(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Get attachments",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"payload", filename="p.txt")],
+        )
+        attachments = list(backend.get_attachments(notification.id))
         assert len(attachments) == 1
+        assert attachments[0].file.read() == b"payload"
 
-        attachment = attachments[0]
-        assert attachment.name == os.path.basename(tmp_file_path)
-        assert attachment.mime_type == 'application/octet-stream'
-        assert attachment.size > 0
-        assert attachment.file  # File should be saved
-
-    def test_store_attachments_with_file_path(self):
-        """Test _store_attachments method with file path attachment"""
+    def test_store_and_find_attachment_file_record(self):
         backend = DjangoDbNotificationBackend()
+        manager = backend._attachment_manager
+        record = manager.upload_file(b"blob bytes", "blob.txt", "text/plain")
+        stored = backend.store_attachment_file_record(record)
+        assert backend.get_attachment_file_record(stored.id) is not None
+        found = backend.find_attachment_file_by_checksum(record.checksum, record.size)
+        assert found is not None
+        assert found.id == stored.id
+        # Size guards against a checksum-only collision.
+        assert backend.find_attachment_file_by_checksum(record.checksum, record.size + 1) is None
 
-        # Create a temporary file for testing
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
-            tmp_file.write("Test content for attachment")
-            tmp_file_path = tmp_file.name
-
-        # Track the temp file for cleanup
-        self.temp_files.append(tmp_file_path)
-
-        # Create mock attachment with file_path
-        mock_attachment = Mock(spec=NotificationAttachment)
-        mock_attachment.file_path = tmp_file_path
-
-        # Test the _store_attachments method directly
-        stored_attachments = backend._store_attachments([mock_attachment])
-
-        assert len(stored_attachments) == 1
-        attachment = stored_attachments[0]
-
-        # Verify attachment properties
-        assert isinstance(attachment, AttachmentModel)
-        assert attachment.name == os.path.basename(tmp_file_path)
-        assert attachment.mime_type == 'application/octet-stream'
-        assert attachment.size > 0
-        assert attachment.file  # File should be saved but not yet linked to notification
-
-        # Note: attachment.notification should be None since it's not yet linked
-        assert attachment.notification_id is None
-
-    def test_store_attachments_without_file_path(self):
-        """Test _store_attachments method with attachment that doesn't have file_path"""
+    def test_delete_notification_attachment_keeps_file_record(self):
         backend = DjangoDbNotificationBackend()
-
-        # Create mock attachment without file_path
-        mock_attachment = Mock(spec=NotificationAttachment)
-        # Deliberately not setting file_path attribute
-
-        # Test the _store_attachments method directly
-        with pytest.raises(ValueError):
-            backend._store_attachments([mock_attachment])
-
-    def test_store_attachments_multiple_files(self):
-        """Test _store_attachments method with multiple file path attachments"""
-        backend = DjangoDbNotificationBackend()
-
-        # Create multiple temporary files for testing
-        tmp_files = []
-        for i in range(3):
-            tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix=f'_{i}.txt', delete=False)
-            tmp_file.write(f"Test content for attachment {i}")
-            tmp_file.close()
-            tmp_files.append(tmp_file.name)
-
-        # Track temp files for cleanup
-        self.temp_files.extend(tmp_files)
-
-        # Create mock attachments
-        mock_attachments = []
-        for tmp_file_path in tmp_files:
-            mock_attachment = Mock(spec=NotificationAttachment)
-            mock_attachment.file_path = tmp_file_path
-            mock_attachments.append(mock_attachment)
-
-        # Test the _store_attachments method with multiple attachments
-        stored_attachments = backend._store_attachments(mock_attachments)
-
-        assert len(stored_attachments) == 3
-
-        # Sort both lists by file name for consistent comparison
-        stored_attachments_sorted = sorted(stored_attachments, key=lambda x: x.name)
-        tmp_files_sorted = sorted(tmp_files, key=lambda x: os.path.basename(x))
-
-        for i, attachment in enumerate(stored_attachments_sorted):
-            assert isinstance(attachment, AttachmentModel)
-            assert attachment.name == os.path.basename(tmp_files_sorted[i])
-            assert attachment.mime_type == 'application/octet-stream'
-            assert attachment.size > 0
-            assert attachment.file
-
-    def test_persist_notification_with_multiple_attachments(self):
-        """Test persisting regular notification with multiple attachments"""
-        backend = DjangoDbNotificationBackend()
-
-        # Create multiple temporary files for testing
-        tmp_files = []
-        for i in range(2):
-            tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix=f'_multi_{i}.txt', delete=False)
-            tmp_file.write(f"Multi attachment content {i}")
-            tmp_file.close()
-            tmp_files.append(tmp_file.name)
-
-        # Track temp files for cleanup
-        self.temp_files.extend(tmp_files)
-
-        # Create mock attachments
-        mock_attachments = []
-        for tmp_file_path in tmp_files:
-            mock_attachment = Mock(spec=NotificationAttachment)
-            mock_attachment.file_path = tmp_file_path
-            mock_attachments.append(mock_attachment)
-
         notification = backend.persist_notification(
             user_id=self.user.pk,
             notification_type=NotificationTypes.EMAIL.value,
-            title="Test with multiple attachments",
+            title="Delete join",
             body_template="test",
             context_name="test",
             context_kwargs={},
             send_after=None,
-            attachments=mock_attachments,
+            attachments=[self._attachment(content=b"keep me", filename="k.txt")],
         )
+        join_id = notification.attachments[0].id
+        backend.delete_notification_attachment(join_id)
+        assert NotificationAttachmentModel.objects.filter(pk=join_id).count() == 0
+        # The file record survives -- deleting one reference never drops the blob.
+        assert AttachmentFileRecordModel.objects.count() == 1
 
-        assert isinstance(notification, Notification)
-
-        # Verify both attachments were stored
-        notification_db_record = NotificationModel.objects.get(id=notification.id)
-        attachments = notification_db_record.attachments.all()
-        assert len(attachments) == 2
-
-        # Get attachment names and verify all expected files are there
-        attachment_names = [attachment.name for attachment in attachments]
-        expected_names = [os.path.basename(tmp_file) for tmp_file in tmp_files]
-        assert sorted(attachment_names) == sorted(expected_names)
-
-    def test_persist_one_off_notification_with_multiple_attachments(self):
-        """Test persisting one-off notification with multiple attachments"""
+    def test_get_orphaned_attachment_files(self):
         backend = DjangoDbNotificationBackend()
-
-        # Create multiple temporary files for testing
-        tmp_files = []
-        for i in range(2):
-            tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix=f'_oneoff_multi_{i}.txt', delete=False)
-            tmp_file.write(f"One-off multi attachment content {i}")
-            tmp_file.close()
-            tmp_files.append(tmp_file.name)
-
-        # Track temp files for cleanup
-        self.temp_files.extend(tmp_files)
-
-        # Create mock attachments
-        mock_attachments = []
-        for tmp_file_path in tmp_files:
-            mock_attachment = Mock(spec=NotificationAttachment)
-            mock_attachment.file_path = tmp_file_path
-            mock_attachments.append(mock_attachment)
-
-        one_off_notification = backend.persist_one_off_notification(
-            email_or_phone="multi@example.com",
-            first_name="Jane",
-            last_name="Smith",
-            notification_type=NotificationTypes.EMAIL.value,
-            title="One-off with multiple attachments",
-            body_template="test",
-            context_name="test",
-            context_kwargs={},
-            attachments=mock_attachments,
-        )
-
-        assert isinstance(one_off_notification, OneOffNotification)
-
-        # Verify both attachments were stored
-        notification_db_record = NotificationModel.objects.get(id=one_off_notification.id)
-        attachments = notification_db_record.attachments.all()
-        assert len(attachments) == 2
-
-        # Get attachment names and verify all expected files are there
-        attachment_names = [attachment.name for attachment in attachments]
-        expected_names = [os.path.basename(tmp_file) for tmp_file in tmp_files]
-        assert sorted(attachment_names) == sorted(expected_names)
-
-    def test_persist_notification_with_empty_attachments_list(self):
-        """Test persisting notification with empty attachments list"""
-        backend = DjangoDbNotificationBackend()
-
         notification = backend.persist_notification(
             user_id=self.user.pk,
             notification_type=NotificationTypes.EMAIL.value,
-            title="Test without attachments",
+            title="Orphan",
             body_template="test",
             context_name="test",
             context_kwargs={},
             send_after=None,
-            attachments=[],  # Empty list
+            attachments=[self._attachment(content=b"orphan bytes", filename="o.txt")],
         )
+        # Referenced: not orphaned yet.
+        assert list(backend.get_orphaned_attachment_files()) == []
+        backend.delete_notification_attachment(notification.attachments[0].id)
+        orphans = list(backend.get_orphaned_attachment_files())
+        assert len(orphans) == 1
 
-        assert isinstance(notification, Notification)
-
-        # Verify no attachments were stored
-        notification_db_record = NotificationModel.objects.get(id=notification.id)
-        attachments = notification_db_record.attachments.all()
-        assert len(attachments) == 0
-
-    def test_persist_notification_with_none_attachments(self):
-        """Test persisting notification with None attachments"""
+    def test_delete_attachment_file(self):
         backend = DjangoDbNotificationBackend()
+        record = backend.store_attachment_file_record(
+            backend._attachment_manager.upload_file(b"x", "x.txt", "text/plain")
+        )
+        backend.delete_attachment_file(record.id)
+        assert backend.get_attachment_file_record(record.id) is None
 
-        notification = backend.persist_notification(
+    # --------------------------------------------------------------- filter_notifications
+
+    def _make(self, backend, **overrides):
+        kwargs = dict(
             user_id=self.user.pk,
             notification_type=NotificationTypes.EMAIL.value,
-            title="Test with None attachments",
+            title="T",
+            body_template="body_a",
+            context_name="ctx",
+            context_kwargs={},
+            send_after=None,
+        )
+        kwargs.update(overrides)
+        return backend.persist_notification(**kwargs)
+
+    def test_filter_notifications_empty_filter_matches_all(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend)
+        self._make(backend, notification_type=NotificationTypes.IN_APP.value)
+        results = list(backend.filter_notifications({}, page=1, page_size=10))
+        assert len(results) == 2
+        assert backend.count_notifications({}) == 2
+
+    def test_filter_notifications_membership(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, notification_type=NotificationTypes.EMAIL.value)
+        self._make(backend, notification_type=NotificationTypes.IN_APP.value)
+        results = list(
+            backend.filter_notifications(
+                {"notification_type": NotificationTypes.IN_APP.value}, page=1, page_size=10
+            )
+        )
+        assert len(results) == 1
+        assert results[0].notification_type == NotificationTypes.IN_APP.value
+
+    def test_filter_notifications_string_lookup(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, body_template="welcome_email")
+        self._make(backend, body_template="goodbye_email")
+        results = list(
+            backend.filter_notifications(
+                {"body_template": {"lookup": "starts_with", "value": "welcome"}},
+                page=1,
+                page_size=10,
+            )
+        )
+        assert len(results) == 1
+        assert results[0].body_template == "welcome_email"
+
+    def test_filter_notifications_and_or_not(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, tenant="acme", body_template="body_a")
+        self._make(backend, tenant="acme", body_template="body_b")
+        self._make(backend, tenant="other", body_template="body_a")
+
+        and_results = list(
+            backend.filter_notifications(
+                {"and": [{"tenant": "acme"}, {"body_template": "body_a"}]},
+                page=1,
+                page_size=10,
+            )
+        )
+        assert len(and_results) == 1
+
+        or_results = list(
+            backend.filter_notifications(
+                {"or": [{"tenant": "other"}, {"body_template": "body_b"}]},
+                page=1,
+                page_size=10,
+            )
+        )
+        assert len(or_results) == 2
+
+    def test_filter_notifications_not_includes_null_rows(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, tenant="acme")
+        self._make(backend, tenant=None)  # tenant is NULL
+        results = list(
+            backend.filter_notifications({"not": {"tenant": "acme"}}, page=1, page_size=10)
+        )
+        # A positive filter never matches NULL, so NULL rows ARE included under negation.
+        assert len(results) == 1
+        assert results[0].tenant is None
+
+    def test_filter_notifications_ordering_and_pagination(self):
+        backend = DjangoDbNotificationBackend()
+        first = self._make(backend, title="first")
+        second = self._make(backend, title="second")
+        order_by = {"field": "created_at", "direction": "asc"}
+        page1 = list(backend.filter_notifications({}, page=1, page_size=1, order_by=order_by))
+        page2 = list(backend.filter_notifications({}, page=2, page_size=1, order_by=order_by))
+        assert [str(page1[0].id)] == [str(first.id)]
+        assert [str(page2[0].id)] == [str(second.id)]
+
+    def test_filter_notifications_date_range(self):
+        backend = DjangoDbNotificationBackend()
+        past = self._make(backend, send_after=timezone.now() - timedelta(days=2))
+        self._make(backend, send_after=timezone.now() + timedelta(days=2))
+        results = list(
+            backend.filter_notifications(
+                {"send_after_range": {"to": timezone.now()}}, page=1, page_size=10
+            )
+        )
+        assert [str(n.id) for n in results] == [str(past.id)]
+
+    def test_get_filter_capabilities_is_empty(self):
+        assert DjangoDbNotificationBackend().get_filter_capabilities() == {}
+
+    # --------------------------------------------------------------- resend attachment path
+
+    def test_persist_notification_update_links_stored_attachments(self):
+        backend = DjangoDbNotificationBackend()
+        source = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Source",
             body_template="test",
             context_name="test",
             context_kwargs={},
             send_after=None,
-            attachments=None,  # None
+            attachments=[self._attachment(content=b"resend bytes", filename="r.txt")],
         )
-
-        assert isinstance(notification, Notification)
-
-        # Verify no attachments were stored
-        notification_db_record = NotificationModel.objects.get(id=notification.id)
-        attachments = notification_db_record.attachments.all()
-        assert len(attachments) == 0
-
-    def test_store_attachments_with_file_read_error(self):
-        """Test _store_attachments method with file that cannot be read"""
-        backend = DjangoDbNotificationBackend()
-
-        # Create mock attachment with non-existent file path
-        mock_attachment = Mock(spec=NotificationAttachment)
-        mock_attachment.file_path = "/non/existent/file/path.txt"
-
-        # Test should raise FileNotFoundError
-        with pytest.raises(FileNotFoundError):
-            backend._store_attachments([mock_attachment])
-
-    def test_serialize_one_off_notification_with_attachments(self):
-        """Test serialization of one-off notification includes attachments"""
-        backend = DjangoDbNotificationBackend()
-
-        # Create a temporary file for testing
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
-            tmp_file.write("Serialization test content")
-            tmp_file_path = tmp_file.name
-
-        # Track temp file for cleanup
-        self.temp_files.append(tmp_file_path)
-
-        # Create mock attachment
-        mock_attachment = Mock(spec=NotificationAttachment)
-        mock_attachment.file_path = tmp_file_path
-
-        one_off_notification = backend.persist_one_off_notification(
-            email_or_phone="serialize@example.com",
-            first_name="Test",
-            last_name="User",
+        clone = backend.persist_notification(
+            user_id=self.user.pk,
             notification_type=NotificationTypes.EMAIL.value,
-            title="Serialization test",
+            title="Clone",
             body_template="test",
             context_name="test",
             context_kwargs={},
-            attachments=[mock_attachment],
+            send_after=None,
+        )
+        updated = backend.persist_notification_update(
+            clone.id, {"attachments": list(source.attachments)}
+        )
+        assert len(updated.attachments) == 1
+        assert updated.attachments[0].file.read() == b"resend bytes"
+        # No new blob -- the clone references the source's file record.
+        assert AttachmentFileRecordModel.objects.count() == 1
+
+    # --------------------------------------------------------------- coverage: edges
+
+    def test_future_notification_queries(self):
+        backend = DjangoDbNotificationBackend()
+        future = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Future",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=timezone.now() + timedelta(days=1),
+        )
+        assert any(str(n.id) == str(future.id) for n in backend.get_all_future_notifications())
+        assert any(
+            str(n.id) == str(future.id)
+            for n in backend.get_future_notifications(page=1, page_size=10)
+        )
+        assert any(
+            str(n.id) == str(future.id)
+            for n in backend.get_all_future_notifications_from_user(self.user.pk)
+        )
+        assert any(
+            str(n.id) == str(future.id)
+            for n in backend.get_future_notifications_from_user(self.user.pk, page=1, page_size=10)
         )
 
-        # Verify serialization includes attachments
-        assert isinstance(one_off_notification, OneOffNotification)
-        assert hasattr(one_off_notification, 'attachments')
-        assert len(one_off_notification.attachments) == 1
+    def test_get_user_email_from_notification_inactive_user_raises(self):
+        from vintasend.exceptions import NotificationUserNotFoundError
 
-        attachment = one_off_notification.attachments[0]
-        assert attachment.filename == os.path.basename(tmp_file_path)
-        assert attachment.content_type == 'application/octet-stream'
-        assert attachment.size > 0
-
-    def test_serialize_attachment_checksum_calculation(self):
-        """Test that _serialize_attachment correctly calculates SHA-256 checksum"""
+        inactive = self.create_user(email="inactive@example.com", is_active=False)
         backend = DjangoDbNotificationBackend()
-
-        # Create a temporary file with known content
-        test_content = b"Test content for checksum calculation"
-        expected_checksum = hashlib.sha256(test_content).hexdigest()
-
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(test_content)
-            tmp_file_path = tmp_file.name
-
-        self.temp_files.append(tmp_file_path)
-
-        try:
-            # Create mock attachment and store it
-            mock_attachment = Mock(spec=NotificationAttachment)
-            mock_attachment.file_path = tmp_file_path
-
-            stored_attachments = backend._store_attachments([mock_attachment])
-            attachment_instance = stored_attachments[0]
-
-            # Set notification (required for save)
-            notification_instance = NotificationModel.objects.create(
-                user_id=str(self.user.pk),
-                notification_type=NotificationTypes.EMAIL.value,
-                title="Checksum test",
-                body_template="test",
-                context_name="test",
-                context_kwargs={},
-            )
-            attachment_instance.notification = notification_instance
-            attachment_instance.save()
-
-            # Test the _serialize_attachment method
-            stored_attachment = backend._serialize_attachment(attachment_instance)
-
-            # Verify checksum is calculated correctly
-            assert stored_attachment.checksum == expected_checksum
-            assert len(stored_attachment.checksum) == 64  # SHA-256 hex length
-            assert stored_attachment.filename == os.path.basename(tmp_file_path)
-            assert stored_attachment.size == len(test_content)
-
-        finally:
-            # Cleanup is handled by tearDown method
-            pass
-
-    def test_serialize_attachment_checksum_with_empty_file(self):
-        """Test checksum calculation with an empty file"""
-        backend = DjangoDbNotificationBackend()
-
-        # Empty content should have specific SHA-256 hash
-        test_content = b""
-        expected_checksum = hashlib.sha256(test_content).hexdigest()
-
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            # Don't write anything - file is empty
-            tmp_file_path = tmp_file.name
-
-        self.temp_files.append(tmp_file_path)
-
-        try:
-            # Create mock attachment and store it
-            mock_attachment = Mock(spec=NotificationAttachment)
-            mock_attachment.file_path = tmp_file_path
-
-            stored_attachments = backend._store_attachments([mock_attachment])
-            attachment_instance = stored_attachments[0]
-
-            # Set notification (required for save)
-            notification_instance = NotificationModel.objects.create(
-                user_id=str(self.user.pk),
-                notification_type=NotificationTypes.EMAIL.value,
-                title="Empty checksum test",
-                body_template="test",
-                context_name="test",
-                context_kwargs={},
-            )
-            attachment_instance.notification = notification_instance
-            attachment_instance.save()
-
-            # Test the _serialize_attachment method
-            stored_attachment = backend._serialize_attachment(attachment_instance)
-
-            # Verify checksum for empty file
-            assert stored_attachment.checksum == expected_checksum
-            assert stored_attachment.checksum == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"  # SHA-256 of empty string
-
-        finally:
-            # Cleanup is handled by tearDown method
-            pass
-
-    def test_serialize_attachment_checksum_with_binary_content(self):
-        """Test checksum calculation with binary content"""
-        backend = DjangoDbNotificationBackend()
-
-        # Create binary content
-        test_content = bytes(range(256))  # All possible byte values
-        expected_checksum = hashlib.sha256(test_content).hexdigest()
-
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(test_content)
-            tmp_file_path = tmp_file.name
-
-        self.temp_files.append(tmp_file_path)
-
-        try:
-            # Create mock attachment and store it
-            mock_attachment = Mock(spec=NotificationAttachment)
-            mock_attachment.file_path = tmp_file_path
-
-            stored_attachments = backend._store_attachments([mock_attachment])
-            attachment_instance = stored_attachments[0]
-
-            # Set notification (required for save)
-            notification_instance = NotificationModel.objects.create(
-                user_id=str(self.user.pk),
-                notification_type=NotificationTypes.EMAIL.value,
-                title="Binary checksum test",
-                body_template="test",
-                context_name="test",
-                context_kwargs={},
-            )
-            attachment_instance.notification = notification_instance
-            attachment_instance.save()
-
-            # Test the _serialize_attachment method
-            stored_attachment = backend._serialize_attachment(attachment_instance)
-
-            # Verify checksum for binary content
-            assert stored_attachment.checksum == expected_checksum
-            assert len(stored_attachment.checksum) == 64  # SHA-256 hex length
-            assert stored_attachment.size == len(test_content)
-
-        finally:
-            # Cleanup is handled by tearDown method
-            pass
-
-    def test_serialize_attachment_checksum_with_no_file(self):
-        """Test _serialize_attachment when attachment has no file"""
-        backend = DjangoDbNotificationBackend()
-
-        # Create attachment without file
-        attachment_instance = AttachmentModel(
-            name="no_file_attachment",
-            mime_type="text/plain",
-            size=0,
+        notification = backend.persist_notification(
+            user_id=inactive.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Inactive",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
         )
+        with pytest.raises(NotificationUserNotFoundError):
+            backend.get_user_email_from_notification(notification.id)
 
-        # Don't set the file field
-
-        # Test the _serialize_attachment method
-        stored_attachment = backend._serialize_attachment(attachment_instance)
-
-        # Should have empty checksum when no file
-        assert stored_attachment.checksum == ""
-        assert stored_attachment.filename == "no_file_attachment"
-        assert stored_attachment.size == 0
-
-    def test_serialize_attachment_checksum_with_file_read_error(self):
-        """Test _serialize_attachment handles file read errors gracefully"""
+    def test_get_notification_for_update(self):
         backend = DjangoDbNotificationBackend()
-
-        # Create attachment with mock file that raises OSError
-        attachment_instance = AttachmentModel(
-            name="error_file_attachment",
-            mime_type="text/plain",
-            size=100,
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="For update",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
         )
+        fetched = backend.get_notification(notification.id, for_update=True)
+        assert str(fetched.id) == str(notification.id)
 
-        # Mock the file to raise an OSError when read
-        mock_file = Mock()
-        mock_file.seek.side_effect = OSError("File read error")
-        attachment_instance.file = mock_file
+    def test_get_one_off_notification_not_found(self):
+        backend = DjangoDbNotificationBackend()
+        with pytest.raises(NotificationNotFoundError):
+            backend._get_one_off_notification(random.randint(10000, 20000))
 
-        # Test the _serialize_attachment method
-        stored_attachment = backend._serialize_attachment(attachment_instance)
+    def test_mark_pending_as_failed_already_sent_raises(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Failed guard",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        backend.mark_pending_as_sent(notification.id)
+        with pytest.raises(NotificationUpdateError):
+            backend.mark_pending_as_failed(notification.id)
 
-        # Should have empty checksum when file read fails
-        assert stored_attachment.checksum == ""
-        assert stored_attachment.filename == "error_file_attachment"
-        assert stored_attachment.size == 100
+    def test_mark_sent_as_read_not_sent_raises(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.IN_APP.value,
+            title="Read guard",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        # Still pending, never sent -> cannot be marked read.
+        with pytest.raises(NotificationUpdateError):
+            backend.mark_sent_as_read(notification.id)
+
+    def test_persist_notification_update_already_sent_raises(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Update guard",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        backend.mark_pending_as_sent(notification.id)
+        with pytest.raises(NotificationUpdateError):
+            backend.persist_notification_update(notification.id, {"title": "new"})
+
+    def test_persist_notification_update_attachments_only_on_sent_raises(self):
+        backend = DjangoDbNotificationBackend()
+        source = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Attach source",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"bytes", filename="a.txt")],
+        )
+        sent = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Already sent",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        backend.mark_pending_as_sent(sent.id)
+        with pytest.raises(NotificationUpdateError):
+            backend.persist_notification_update(
+                sent.id, {"attachments": list(source.attachments)}
+            )
+
+    def test_persist_notification_update_unknown_stored_attachment_raises(self):
+        from vintasend.services.dataclasses import StoredAttachment
+
+        backend = DjangoDbNotificationBackend()
+        clone = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Clone",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        bogus = StoredAttachment(
+            id="1",
+            filename="x.txt",
+            content_type="text/plain",
+            size=1,
+            checksum="x",
+            created_at=timezone.now(),
+            file=backend._attachment_manager.reconstruct_attachment_file({"id": "missing", "name": "missing"}),
+            file_id="999999",
+        )
+        with pytest.raises(AttachmentFileNotFoundError):
+            backend.persist_notification_update(clone.id, {"attachments": [bogus]})
+
+    def test_store_context_used(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Context",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+        backend.store_context_used(notification.id, {"k": "v"}, "adapter.path")
+        record = NotificationModel.objects.get(id=notification.id)
+        assert record.context_used == {"k": "v"}
+        assert record.adapter_used == "adapter.path"
+
+    def test_filter_notifications_date_range_lower_bound(self):
+        backend = DjangoDbNotificationBackend()
+        recent = self._make(backend, send_after=timezone.now() + timedelta(days=1))
+        self._make(backend, send_after=timezone.now() - timedelta(days=5))
+        results = list(
+            backend.filter_notifications(
+                {"send_after_range": {"from": timezone.now()}}, page=1, page_size=10
+            )
+        )
+        assert [str(n.id) for n in results] == [str(recent.id)]
+
+    def test_filter_notifications_unknown_field_matches_nothing(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend)
+        assert list(backend.filter_notifications({"nope": "x"}, page=1, page_size=10)) == []
+        # Under negation an unknown field matches everything.
+        assert len(list(backend.filter_notifications({"not": {"nope": "x"}}, page=1, page_size=10))) == 1
+
+    def test_filter_notifications_empty_logical_groups(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend)
+        # Empty AND matches everything; empty OR matches nothing.
+        assert len(list(backend.filter_notifications({"and": []}, page=1, page_size=10))) == 1
+        assert list(backend.filter_notifications({"or": []}, page=1, page_size=10)) == []
+
+    # --------------------------------------------------------------- attachment file handle
+
+    def test_attachment_file_handle_stream_url_delete(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Handle",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[self._attachment(content=b"stream me", filename="s.txt")],
+        )
+        stored = next(iter(backend.get_attachments(notification.id)))
+        with stored.file.stream() as stream:
+            assert stream.read() == b"stream me"
+        assert stored.file.url()
+        stored.file.delete()

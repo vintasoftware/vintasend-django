@@ -1,14 +1,55 @@
+import io
 import uuid
 
 from django.core import mail
+from django.utils import timezone
 
 import pytest
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationTemplateRenderingError,
 )
-from vintasend.services.dataclasses import Notification, OneOffNotification
+from vintasend.services.dataclasses import (
+    AttachmentFile,
+    Notification,
+    OneOffNotification,
+    StoredAttachment,
+)
 from vintasend.services.notification_backends.stubs.fake_backend import FakeFileBackend
+
+
+class _InMemoryAttachmentFile(AttachmentFile):
+    """Minimal AttachmentFile handle for exercising the adapter's attach path."""
+
+    def __init__(self, data: bytes, fail: bool = False):
+        self._data = data
+        self._fail = fail
+
+    def read(self) -> bytes:
+        if self._fail:
+            raise OSError("cannot read attachment")
+        return self._data
+
+    def stream(self):
+        return io.BytesIO(self._data)
+
+    def url(self, expires_in: int = 3600) -> str:
+        return "mem://attachment"
+
+    def delete(self) -> None:
+        pass
+
+
+def _stored_attachment(data: bytes = b"payload", fail: bool = False) -> StoredAttachment:
+    return StoredAttachment(
+        id="1",
+        filename="doc.txt",
+        content_type="text/plain",
+        size=len(data),
+        checksum="deadbeef",
+        created_at=timezone.now(),
+        file=_InMemoryAttachmentFile(data, fail=fail),
+    )
 
 from vintasend_django.services.notification_adapters.django_email import (
     DjangoEmailNotificationAdapter,
@@ -134,3 +175,43 @@ class DjangoEmailNotificationAdapterTestCase(VintaSendDjangoTestCase):
             status=NotificationStatus.PENDING_SEND.value,
             attachments=[],
         )
+
+    def test_send_one_off_notification_with_attachment(self):
+        """The adapter reads each StoredAttachment through its file handle and attaches it."""
+        one_off_notification = self.create_one_off_notification()
+        one_off_notification.attachments = [_stored_attachment(b"file bytes")]
+        context = self.create_notification_context()
+
+        adapter = DjangoEmailNotificationAdapter(
+            "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+            "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
+            backend_kwargs={"database_file_name": "django-email-adapter-test-attachment.json"},
+        )
+
+        adapter.send(one_off_notification, context)
+
+        assert len(mail.outbox) == 1
+        email = mail.outbox[0]
+        assert len(email.attachments) == 1
+        name, content, mimetype = email.attachments[0]
+        assert name == "doc.txt"
+        # Django decodes text/* attachment payloads to str; normalize before comparing.
+        assert (content.encode() if isinstance(content, str) else content) == b"file bytes"
+        assert mimetype == "text/plain"
+
+    def test_send_one_off_notification_with_unreadable_attachment_still_sends(self):
+        """A failing attachment is logged and skipped; the email still goes out."""
+        one_off_notification = self.create_one_off_notification()
+        one_off_notification.attachments = [_stored_attachment(fail=True)]
+        context = self.create_notification_context()
+
+        adapter = DjangoEmailNotificationAdapter(
+            "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+            "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
+            backend_kwargs={"database_file_name": "django-email-adapter-test-attachment-fail.json"},
+        )
+
+        adapter.send(one_off_notification, context)
+
+        assert len(mail.outbox) == 1
+        assert len(mail.outbox[0].attachments) == 0

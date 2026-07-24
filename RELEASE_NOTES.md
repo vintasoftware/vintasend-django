@@ -1,6 +1,91 @@
 # Release Notes
 
 
+## Version 2.0.0 (2026-07-23)
+
+Compatibility release for VintaSend core 2.0.0. Implements the new backend abstract methods
+(the filtering / ordering API, the attachment manager seam, git-commit-SHA storage) and adds a
+Django-storage-backed attachment manager. Requires `vintasend>=2.0.0`.
+
+### Features
+
+* **Filtering / ordering** — `filter_notifications(filter, page, page_size, order_by=None)`,
+  `count_notifications(filter)` and `get_filter_capabilities()` translate the composable filter
+  vocabulary from `vintasend.services.notification_backends.filters` into Django `Q` objects.
+  Translation runs in negation-normal form so NULL semantics match the reference in-memory
+  evaluator exactly: a positive filter never matches a NULL value, and NULL rows ARE included
+  under `not`. Ordering always appends an `id` tiebreaker in the primary direction for stable
+  offset pagination. The backend supports the full vocabulary, so `get_filter_capabilities()`
+  returns `{}`.
+* **Attachment manager seam** — the backend now persists checksum-indexed file records and
+  notification/file join rows and delegates every byte to an injected `BaseAttachmentManager`.
+  New `DjangoAttachmentManager`
+  (`vintasend_django.services.attachment_managers.django_storage`) stores the bytes in a Django
+  storage backend (`default_storage` by default; pass `storage` / `upload_to` to target another).
+  Uploads are deduplicated on (checksum, size); attach-by-reference
+  (`NotificationAttachmentReference`) links an already-stored file by id. The backend defaults to
+  a `DjangoAttachmentManager` when the service injects none, so it works standalone.
+* **Git commit SHA** — `store_git_commit_sha` persists the send-time revision;
+  `Notification.git_commit_sha` is serialized back onto the dataclass.
+* `persist_notification` / `persist_one_off_notification` accept the new optional `tenant`
+  keyword; `mark_pending_as_sent` sets `sent_at` and `mark_sent_as_read` /
+  `mark_sent_as_read_bulk` set `read_at`. `serialize_*` carry `sent_at`, `read_at`, `tenant`,
+  `git_commit_sha`, and the notification's attachments.
+* `DjangoTemplatedEmailRenderer.render_from_template_content(notification, template_content,
+  context)` renders an email from supplied `EmailTemplateContent` for previews / audits without
+  consulting the notification's stored templates; `render` now also populates
+  `TemplatedEmail.preheader`.
+
+### Migrations
+
+The old `Attachment` model is replaced by `AttachmentFileRecord` (a checksum-indexed stored-blob
+row) + `NotificationAttachment` (the notification/file join row). The upgrade is split across three
+migrations so **existing attachments are preserved** — nothing is dropped until the data has been
+copied:
+
+* `0004_notification_git_commit_sha_notification_read_at_and_more` — additive only: adds `sent_at`,
+  `read_at`, `tenant`, `git_commit_sha` to `Notification` and creates the two new attachment
+  tables.
+* `0005_migrate_attachments_to_file_records` — data migration that copies every legacy `Attachment`
+  row into `AttachmentFileRecord` + `NotificationAttachment`, in bulk (`bulk_create`). The
+  underlying file is **left exactly where it is in storage** — the new record's
+  `storage_identifiers` point at the same path, so no bytes are moved or copied. The migration
+  **never reads a file**, so it runs the same on local disk or a remote backend like S3 and cannot
+  fail because an object is momentarily unreachable. The trade-off: migrated records carry an empty
+  `checksum` and therefore do not participate in the 2.0 (checksum, size) dedup until the same bytes
+  are uploaded fresh — dedup is an optimization, never a correctness requirement. Reversible:
+  reversing it rebuilds the legacy rows.
+* `0006_delete_attachment` — drops the now-empty legacy `Attachment` table.
+
+Run `migrate` after upgrading. Take a database backup first, as with any schema migration.
+
+**Optional checksum backfill.** Because `0005` does not read files, migrated records start with an
+empty `checksum` and do not participate in attachment dedup. A management command backfills them on
+your schedule, decoupled from the deploy:
+
+```bash
+python manage.py backfill_attachment_checksums          # only rows missing a checksum
+python manage.py backfill_attachment_checksums --dry-run --limit 1000
+python manage.py backfill_attachment_checksums --all    # recompute every record
+```
+
+It fetches each file one by one through the configured attachment manager (falling back to
+`DjangoAttachmentManager`), computes the sha256 and real size, and updates the record. It is safe to
+re-run, safe to interrupt, and skips files it cannot read (reporting them) rather than failing the
+whole run. Run it off-peak or in a worker — this is the step that actually touches remote storage
+(e.g. S3), which is exactly why it is kept out of the migration.
+
+### Backwards compatibility
+
+* **Backend/attachment authors:** the `Attachment` model is gone; use `AttachmentFileRecord` +
+  `NotificationAttachment`. Any existing attachment rows (created via the admin, direct ORM use, or
+  the pre-2.0 duck-typed `file_path` / `file_bytes` / `file_obj` write path) are migrated
+  automatically by `0005`; their files are not touched.
+* Application code that only consumes the notification services needs no change. See the core
+  `MIGRATION_TO_2.0.0.md` for the service-level changes (notably `raise_on_failed_send` now
+  defaults to `False`).
+
+
 ## Version 1.2.1 (2026-06-16)
 
 ### Bugfix

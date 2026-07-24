@@ -14,7 +14,7 @@ from vintasend.services.notification_template_renderers.base_templated_email_ren
 
 
 if TYPE_CHECKING:
-    from vintasend.services.notification_service import NotificationContextDict
+    from vintasend.services.dataclasses import NotificationContextDict
 
 
 User = get_user_model()
@@ -84,24 +84,24 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
             }
 
     def _attach_files(self, email_message: EmailMessage, notification: "Notification | OneOffNotification") -> None:
-        """Attach files to email message"""
-        if not hasattr(notification, 'attachments') or not notification.attachments:
+        """Attach a notification's stored files to the email message.
+
+        Reads each ``StoredAttachment`` through its ``AttachmentFile`` handle -- the bytes may
+        live in Django storage, S3, or anywhere the injected attachment manager put them, so
+        the adapter never touches storage directly. ``filename`` and ``content_type`` come off
+        the ``StoredAttachment`` itself.
+        """
+        if not getattr(notification, "attachments", None):
             return
 
         for attachment in notification.attachments:
             try:
                 file_data = attachment.file.read()
-                # Access Django attachment model for metadata
-                django_file = attachment.file
-                if hasattr(django_file, 'attachment'):
-                    name = django_file.attachment.name
-                    mime_type = django_file.attachment.mime_type
-                else:
-                    # Fallback for basic attachment info
-                    name = str(attachment.id) if hasattr(attachment, 'id') else 'attachment'
-                    mime_type = 'application/octet-stream'
-
-                email_message.attach(name, file_data, mime_type)
+                email_message.attach(
+                    attachment.filename,
+                    file_data,
+                    attachment.content_type or "application/octet-stream",
+                )
             except Exception as e:
                 # Log error but don't break notification sending
                 import logging

@@ -1,39 +1,93 @@
 import datetime
-import hashlib
-import os
+import functools
 import uuid
 from collections.abc import Iterable
 from typing import cast
 
-from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import Q, QuerySet
+from django.utils import timezone
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
+    AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
     NotificationUpdateError,
     NotificationUserNotFoundError,
 )
+from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.dataclasses import (
+    AnyNotificationAttachment,
+    AttachmentFileRecord,
     Notification,
     NotificationAttachment,
     OneOffNotification,
     StoredAttachment,
     UpdateNotificationKwargs,
+    is_attachment_reference,
 )
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_backends.filters import (
+    NotificationFilter,
+    NotificationOrderBy,
+    is_field_filter,
+)
 
-from vintasend_django.models import Attachment as AttachmentModel
+from vintasend_django.models import AttachmentFileRecord as AttachmentFileRecordModel
 from vintasend_django.models import Notification as NotificationModel
-from vintasend_django.services.attachment_file import DjangoAttachmentFile
+from vintasend_django.models import NotificationAttachment as NotificationAttachmentModel
+from vintasend_django.services.attachment_managers.django_storage import DjangoAttachmentManager
+
+
+# Filter-field name -> notification model field, split by how each is matched. Mirrors the
+# maps in ``vintasend.services.notification_backends.filters`` so this SQL translation stays
+# faithful to the reference in-memory evaluator.
+_MEMBERSHIP_FIELDS: dict[str, str] = {
+    "status": "status",
+    "notification_type": "notification_type",
+    "adapter_used": "adapter_used",
+    "user_id": "user_id",
+    "tenant": "tenant",
+}
+_STRING_LOOKUP_FIELDS = frozenset({"body_template", "subject_template", "context_name"})
+_RANGE_FIELDS: dict[str, str] = {
+    "send_after_range": "send_after",
+    "created_at_range": "created",
+    "sent_at_range": "sent_at",
+    "read_at_range": "read_at",
+}
+# order_by field name -> model field. ``created_at`` maps to ``created`` and ``updated_at`` to
+# ``modified``, matching the model's ``AutoCreatedField`` / ``AutoLastModifiedField``.
+_ORDER_FIELD_TO_ATTR: dict[str, str] = {
+    "send_after": "send_after",
+    "sent_at": "sent_at",
+    "read_at": "read_at",
+    "created_at": "created",
+    "updated_at": "modified",
+}
+# Django lookup suffixes for each string lookup, case-sensitive first / case-insensitive second.
+_STRING_LOOKUP_SUFFIX: dict[str, tuple[str, str]] = {
+    "exact": ("exact", "iexact"),
+    "starts_with": ("startswith", "istartswith"),
+    "ends_with": ("endswith", "iendswith"),
+    "includes": ("contains", "icontains"),
+}
+# A Q that matches no row, used for an unknown filter field (the reference evaluator treats an
+# unknown field as non-matching) and for ``not {}`` (negating the match-everything empty filter).
+_MATCH_NOTHING = Q(pk__in=[])
 
 
 class DjangoDbNotificationBackend(BaseNotificationBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Default to a Django-storage-backed manager so the backend is usable standalone; the
+        # service replaces this through inject_attachment_manager when one is configured.
+        self._attachment_manager: BaseAttachmentManager = DjangoAttachmentManager()
+
     def _get_all_future_notifications_queryset(self) -> QuerySet["NotificationModel"]:
         return NotificationModel.objects.filter(
-            Q(send_after__gte=datetime.datetime.now()) | Q(send_after__isnull=False),
+            Q(send_after__gte=timezone.now()) | Q(send_after__isnull=False),
             status=NotificationStatus.PENDING_SEND.value,
         ).order_by("created")
 
@@ -62,7 +116,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
     def _get_all_pending_notifications_queryset(self) -> QuerySet["NotificationModel"]:
         return NotificationModel.objects.filter(
-            Q(send_after__lte=datetime.datetime.now()) | Q(send_after__isnull=True),
+            Q(send_after__lte=timezone.now()) | Q(send_after__isnull=True),
             status=NotificationStatus.PENDING_SEND.value,
         ).order_by("created")
 
@@ -107,6 +161,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             adapter_extra_parameters=notification.adapter_extra_parameters,
             created=notification.created,
             modified=notification.modified,
+            sent_at=notification.sent_at,
+            read_at=notification.read_at,
+            tenant=notification.tenant,
+            git_commit_sha=notification.git_commit_sha,
+            attachments=list(self.get_attachments(notification.pk)),
         )
 
     def serialize_one_off_notification(self, notification: NotificationModel) -> OneOffNotification:
@@ -130,86 +189,211 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             adapter_extra_parameters=notification.adapter_extra_parameters,
             created=notification.created,
             modified=notification.modified,
-            attachments=[self._serialize_attachment(att) for att in notification.attachments.all()],
+            sent_at=notification.sent_at,
+            read_at=notification.read_at,
+            tenant=notification.tenant,
+            git_commit_sha=notification.git_commit_sha,
+            attachments=list(self.get_attachments(notification.pk)),
         )
 
-    def _serialize_attachment(self, attachment) -> StoredAttachment:
-        """
-        Convert Django attachment model to StoredAttachment.
+    # ------------------------------------------------------------------ attachments
 
-        Calculates SHA-256 checksum of the file content.
-        """
-        # Calculate checksum by reading the file content
-        checksum = ""
-        if attachment.file:
-            try:
-                # Read file content and calculate SHA-256 hash
-                attachment.file.seek(0)  # Ensure we're at the beginning
-                file_content = attachment.file.read()
-                checksum = hashlib.sha256(file_content).hexdigest()
-                attachment.file.seek(0)  # Reset file position
-            except OSError:
-                # If file reading fails, use empty checksum
-                checksum = ""
+    def _serialize_file_record(self, record: AttachmentFileRecordModel) -> AttachmentFileRecord:
+        """Convert an ``AttachmentFileRecord`` model row to its dataclass.
 
+        ``id`` is the model's own pk (as a string), which is what every ``file_id`` the
+        backend hands out or accepts refers to. The ``storage_identifiers`` are opaque and
+        only ever handed back to the injected attachment manager.
+        """
+        return AttachmentFileRecord(
+            id=str(record.pk),
+            filename=record.filename,
+            content_type=record.content_type,
+            size=record.size,
+            checksum=record.checksum,
+            created_at=record.created,
+            updated_at=record.modified,
+            storage_identifiers=record.storage_identifiers or {},
+        )
+
+    def _stored_attachment_from_join_row(
+        self, join_row: NotificationAttachmentModel, record: AttachmentFileRecordModel
+    ) -> StoredAttachment:
+        manager = self._attachment_manager
+        attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers or {})
         return StoredAttachment(
-            id=str(attachment.pk),
-            filename=attachment.name,
-            content_type=attachment.mime_type,
-            checksum=checksum,
-            size=attachment.size or 0,
-            created_at=attachment.created,
-            file=DjangoAttachmentFile(attachment),
+            id=str(join_row.pk),
+            filename=record.filename,
+            content_type=record.content_type,
+            size=record.size,
+            checksum=record.checksum,
+            created_at=record.created,
+            file=attachment_file,
+            description=join_row.description,
+            is_inline=join_row.is_inline,
+            file_id=str(record.pk),
+            storage_identifiers=record.storage_identifiers or {},
         )
 
-    def _store_attachments(self, attachments: list[NotificationAttachment]) -> list:
-        """Store attachments and return stored attachment objects"""
-        stored_attachments = []
+    def _store_attachments(
+        self,
+        attachments: list[AnyNotificationAttachment],
+        notification_id: int | str | uuid.UUID,
+    ) -> list[StoredAttachment]:
+        """Persist attachments by delegating every byte operation to the injected manager.
+
+        Uploads are deduplicated on (checksum, size): a matching existing file record is
+        reused and no upload happens; otherwise the manager stores the bytes and the new
+        record is persisted. A reference attaches an already-stored file by id, raising
+        ``AttachmentFileNotFoundError`` if that id is unknown. Either path writes one join
+        row; the returned handle is always rebuilt through the manager.
+        """
+        manager = self._attachment_manager
+        stored_attachments: list[StoredAttachment] = []
 
         for attachment in attachments:
+            if is_attachment_reference(attachment):
+                try:
+                    record = AttachmentFileRecordModel.objects.get(pk=attachment.file_id)
+                except (AttachmentFileRecordModel.DoesNotExist, ValueError, TypeError) as e:
+                    raise AttachmentFileNotFoundError(
+                        f"No attachment file record found for file_id={attachment.file_id!r}"
+                    ) from e
+                join_row = NotificationAttachmentModel.objects.create(
+                    notification_id=str(notification_id),
+                    file=record,
+                    description=attachment.description,
+                    is_inline=attachment.is_inline,
+                )
+                stored_attachments.append(
+                    self._stored_attachment_from_join_row(join_row, record)
+                )
+                continue
 
+            # TypeGuard narrows only the reference branch, so restate the upload type.
+            assert isinstance(attachment, NotificationAttachment)  # noqa: S101
 
-            # Handle different attachment input types (simplified for now)
-            file_content = b''
-            file_name = 'attachment'
-            mime_type = 'application/octet-stream'
-
-            # Handle different attachment types
-            if hasattr(attachment, 'file_path'):
-                with open(attachment.file_path, 'rb') as f:
-                    file_content = f.read()
-                file_name = os.path.basename(attachment.file_path)
-            elif hasattr(attachment, 'file_bytes'):
-                file_content = attachment.file_bytes
-                file_name = getattr(attachment, 'file_name', 'attachment')
-            elif hasattr(attachment, 'file_obj'):
-                file_obj = attachment.file_obj
-                file_obj.seek(0)
-                file_content = file_obj.read()
-                file_name = getattr(attachment, 'file_name', 'attachment')
+            # Read the bytes once, up front, so the checksum lookup and (on a miss) the
+            # upload never re-read the same path/URL/stream twice.
+            data = manager.file_to_bytes(attachment.file)
+            checksum = manager.calculate_checksum(data)
+            existing = AttachmentFileRecordModel.objects.filter(
+                checksum=checksum, size=len(data)
+            ).first()
+            if existing is not None:
+                record = existing
             else:
-                raise ValueError(
-                    f"Unsupported attachment type: {type(attachment)}. "
-                    "Attachment must have 'file_path', 'file_bytes', or 'file_obj'."
+                file_record = manager.upload_file(
+                    data, attachment.filename, attachment.content_type
+                )
+                record = AttachmentFileRecordModel.objects.create(
+                    filename=file_record.filename,
+                    content_type=file_record.content_type or "",
+                    size=file_record.size,
+                    checksum=file_record.checksum,
+                    storage_identifiers=file_record.storage_identifiers,
                 )
 
-            # Create attachment record in database
-            attachment_instance = AttachmentModel(
-                name=file_name,
-                mime_type=mime_type,
-                size=len(file_content),
+            join_row = NotificationAttachmentModel.objects.create(
+                notification_id=str(notification_id),
+                file=record,
+                description=attachment.description,
+                is_inline=attachment.is_inline,
             )
-
-            # Save file content to storage
-            attachment_instance.file.save(
-                file_name,
-                ContentFile(file_content),
-                save=False  # Don't save the model instance yet
-            )
-
-            stored_attachments.append(attachment_instance)
+            stored_attachments.append(self._stored_attachment_from_join_row(join_row, record))
 
         return stored_attachments
+
+    def _attach_stored_attachments(
+        self,
+        notification_id: int | str | uuid.UUID,
+        attachments: list[StoredAttachment],
+    ) -> None:
+        """Link already-stored files to a notification by writing join rows only.
+
+        Used by ``persist_notification_update`` (the resend path): each ``StoredAttachment``
+        already points at a persisted ``AttachmentFileRecord`` via ``file_id``, so there is
+        no upload -- only a new join row per attachment.
+        """
+        for attachment in attachments:
+            file_id = str(attachment.file_id or attachment.id)
+            try:
+                record = AttachmentFileRecordModel.objects.get(pk=file_id)
+            except (AttachmentFileRecordModel.DoesNotExist, ValueError, TypeError) as e:
+                raise AttachmentFileNotFoundError(
+                    f"No attachment file record found for file_id={file_id!r}"
+                ) from e
+            NotificationAttachmentModel.objects.create(
+                notification_id=str(notification_id),
+                file=record,
+                description=attachment.description,
+                is_inline=attachment.is_inline,
+            )
+
+    def store_attachment_file_record(
+        self, record: AttachmentFileRecord
+    ) -> AttachmentFileRecord:
+        instance = AttachmentFileRecordModel.objects.create(
+            filename=record.filename,
+            content_type=record.content_type or "",
+            size=record.size,
+            checksum=record.checksum,
+            storage_identifiers=record.storage_identifiers,
+        )
+        return self._serialize_file_record(instance)
+
+    def get_attachment_file_record(self, file_id: str) -> AttachmentFileRecord | None:
+        try:
+            instance = AttachmentFileRecordModel.objects.get(pk=file_id)
+        except (AttachmentFileRecordModel.DoesNotExist, ValueError, TypeError):
+            return None
+        return self._serialize_file_record(instance)
+
+    def find_attachment_file_by_checksum(
+        self, checksum: str, size: int
+    ) -> AttachmentFileRecord | None:
+        instance = AttachmentFileRecordModel.objects.filter(
+            checksum=checksum, size=size
+        ).first()
+        if instance is None:
+            return None
+        return self._serialize_file_record(instance)
+
+    def delete_attachment_file(self, file_id: str) -> None:
+        AttachmentFileRecordModel.objects.filter(pk=file_id).delete()
+
+    def get_orphaned_attachment_files(self) -> Iterable[AttachmentFileRecord]:
+        """Return file records no longer referenced by any notification join row.
+
+        Reclaiming one is a caller-driven, two-step operation this only surfaces candidates
+        for: ``manager.delete_file_by_identifiers(record.storage_identifiers)`` to remove the
+        bytes, then ``backend.delete_attachment_file(record.id)`` to drop the row. Nothing
+        here deletes anything automatically.
+        """
+        orphaned = AttachmentFileRecordModel.objects.filter(notification_attachments__isnull=True)
+        return [self._serialize_file_record(record) for record in orphaned.iterator()]
+
+    def get_attachments(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Iterable[StoredAttachment]:
+        join_rows = NotificationAttachmentModel.objects.filter(
+            notification_id=str(notification_id)
+        ).select_related("file")
+        return [
+            self._stored_attachment_from_join_row(join_row, join_row.file)
+            for join_row in join_rows.iterator()
+        ]
+
+    def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
+        """Delete a single notification attachment join row by its own id.
+
+        Drops only the join row, never the ``AttachmentFileRecord`` or its bytes -- a file
+        may still back other notifications. Reclaiming an orphaned file is a separate,
+        caller-driven step via ``get_orphaned_attachment_files``.
+        """
+        NotificationAttachmentModel.objects.filter(pk=str(attachment_id)).delete()
+
+    # ------------------------------------------------------------------ persistence
 
     def persist_notification(
         self,
@@ -223,7 +407,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         subject_template: str | None = None,
         preheader_template: str | None = None,
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         notification_instance = NotificationModel.objects.create(
             user_id=str(user_id),
@@ -236,14 +421,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             subject_template=subject_template or "",
             preheader_template=preheader_template or "",
             adapter_extra_parameters=adapter_extra_parameters,
+            tenant=tenant,
         )
 
-        # Store attachments relationship
         if attachments:
-            stored_attachments = self._store_attachments(attachments)
-            for attachment in stored_attachments:
-                attachment.notification = notification_instance
-                attachment.save()
+            self._store_attachments(attachments, notification_instance.pk)
 
         return self.serialize_user_notification(notification_instance)
 
@@ -261,7 +443,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> OneOffNotification:
         """Create and store a one-off notification"""
 
@@ -279,34 +462,47 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             subject_template=subject_template or "",
             preheader_template=preheader_template or "",
             adapter_extra_parameters=adapter_extra_parameters,
+            tenant=tenant,
         )
 
-        # Store attachments relationship
         if attachments:
-            stored_attachments = self._store_attachments(attachments)
-            for attachment in stored_attachments:
-                attachment.notification = notification_instance
-                attachment.save()
+            self._store_attachments(attachments, notification_instance.pk)
 
         return self.serialize_one_off_notification(notification_instance)
 
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
     ) -> Notification | OneOffNotification:
-        records_updated = NotificationModel.objects.filter(
-            id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
-        ).update(**updated_data)
+        # ``attachments`` is not a scalar column; it is a set of already-stored files to link
+        # via join rows (the resend path), so pull it out before the row ``update``.
+        update_data = dict(updated_data)
+        attachments = cast(
+            "list[StoredAttachment] | None", update_data.pop("attachments", None)
+        )
 
-        if records_updated == 0:
+        pending = NotificationModel.objects.filter(
+            id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
+        )
+        if update_data:
+            records_updated = pending.update(**update_data)
+            if records_updated == 0:
+                raise NotificationUpdateError(
+                    "Failed to update notification, it may have already been sent"
+                )
+        elif not pending.exists():
             raise NotificationUpdateError(
                 "Failed to update notification, it may have already been sent"
             )
+
+        if attachments:
+            self._attach_stored_attachments(notification_id, attachments)
+
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
     def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
-        ).update(status=NotificationStatus.SENT.value)
+        ).update(status=NotificationStatus.SENT.value, sent_at=timezone.now())
         if records_updated == 0:
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
@@ -322,7 +518,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.SENT.value
-        ).update(status=NotificationStatus.READ.value)
+        ).update(status=NotificationStatus.READ.value, read_at=timezone.now())
         if records_updated == 0:
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
@@ -452,8 +648,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         ``user_id`` is given), or in a non-SENT state are simply skipped and
         never raise. When ``user_id`` is provided the update is scoped to that
         user so rows owned by others are never touched (recommended for
-        endpoints). Returns the serialized notifications for the requested ids
-        that are READ after the operation (newly-marked + already-read).
+        endpoints). ``read_at`` is set on every row moved to READ. Returns the
+        serialized notifications for the requested ids that are READ after the
+        operation (newly-marked + already-read).
         """
         ids = [str(i) for i in notification_ids]
         base = NotificationModel.objects.filter(id__in=ids)
@@ -462,7 +659,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
         with transaction.atomic():
             base.filter(status=NotificationStatus.SENT.value).update(
-                status=NotificationStatus.READ.value
+                status=NotificationStatus.READ.value, read_at=timezone.now()
             )
 
         read_qs = base.filter(status=NotificationStatus.READ.value).order_by("-created", "-id")
@@ -511,3 +708,142 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         NotificationModel.objects.filter(id=str(notification_id)).update(
             context_used=context, adapter_used=adapter_import_str
         )
+
+    def store_git_commit_sha(
+        self,
+        notification_id: int | str | uuid.UUID,
+        git_commit_sha: str,
+    ) -> None:
+        NotificationModel.objects.filter(id=str(notification_id)).update(
+            git_commit_sha=git_commit_sha
+        )
+
+    # ------------------------------------------------------------------ filtering
+
+    def _string_lookup_q(self, model_field: str, spec: object) -> Q:
+        if isinstance(spec, dict):
+            lookup = spec.get("lookup", "exact")
+            value = spec.get("value", "")
+            case_sensitive = spec.get("case_sensitive", True)
+        else:
+            lookup = "exact"
+            value = spec
+            case_sensitive = True
+        sensitive_suffix, insensitive_suffix = _STRING_LOOKUP_SUFFIX.get(
+            lookup, _STRING_LOOKUP_SUFFIX["exact"]
+        )
+        suffix = sensitive_suffix if case_sensitive else insensitive_suffix
+        return Q(**{f"{model_field}__{suffix}": value})
+
+    def _range_q(self, model_field: str, spec: object) -> Q:
+        query = Q()
+        if not isinstance(spec, dict):
+            return query
+        lower = spec.get("from")
+        upper = spec.get("to")
+        if lower is not None:
+            query &= Q(**{f"{model_field}__gte": lower})
+        if upper is not None:
+            query &= Q(**{f"{model_field}__lte": upper})
+        return query
+
+    def _field_leaf(self, field: str, value: object) -> tuple[Q, str | None]:
+        """Positive Q for one field filter, plus the model field to OR ``__isnull`` on when
+        this leaf is negated. Returns the match-nothing Q (and no null field) for an unknown
+        field, mirroring the reference evaluator's "unknown field never matches"."""
+        if field in _RANGE_FIELDS:
+            model_field = _RANGE_FIELDS[field]
+            return self._range_q(model_field, value), model_field
+        if field in _STRING_LOOKUP_FIELDS:
+            return self._string_lookup_q(field, value), field
+        if field in _MEMBERSHIP_FIELDS:
+            model_field = _MEMBERSHIP_FIELDS[field]
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            normalized = [v.value if hasattr(v, "value") else v for v in values]
+            return Q(**{f"{model_field}__in": normalized}), model_field
+        return _MATCH_NOTHING, None
+
+    def _translate_filter(self, filter: NotificationFilter, negated: bool = False) -> Q:  # noqa: A002
+        """Translate a composable filter to a Django ``Q``, pushing negation to the leaves.
+
+        Working in negation-normal form keeps NULL semantics correct: a positive leaf excludes
+        NULL rows (a positive filter on a NULL value never matches), while a negated leaf ORs
+        in ``field__isnull=True`` so NULL rows ARE included under ``not`` -- exactly what the
+        reference in-memory evaluator does.
+        """
+        if "and" in filter:
+            subs = [self._translate_filter(sub, negated) for sub in filter["and"]]  # type: ignore[typeddict-item]
+            combiner = _or_all if negated else _and_all  # De Morgan under negation
+            return combiner(subs)
+        if "or" in filter:
+            subs = [self._translate_filter(sub, negated) for sub in filter["or"]]  # type: ignore[typeddict-item]
+            combiner = _and_all if negated else _or_all
+            return combiner(subs)
+        if "not" in filter:
+            return self._translate_filter(filter["not"], not negated)  # type: ignore[typeddict-item]
+
+        # Field filter. Empty ``{}`` matches everything (or nothing when negated). Multiple keys
+        # are an implicit AND (OR under negation, by De Morgan).
+        if not is_field_filter(filter):
+            return _MATCH_NOTHING if not negated else Q()
+        items = list(filter.items())
+        if not items:
+            return _MATCH_NOTHING if negated else Q()
+        leaf_qs: list[Q] = []
+        for key, value in items:
+            positive_q, null_field = self._field_leaf(key, value)
+            if not negated:
+                leaf_qs.append(positive_q)
+            else:
+                negated_q = ~positive_q
+                if null_field is not None:
+                    negated_q |= Q(**{f"{null_field}__isnull": True})
+                leaf_qs.append(negated_q)
+        return _or_all(leaf_qs) if negated else _and_all(leaf_qs)
+
+    def _filtered_queryset(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        order_by: NotificationOrderBy | None = None,
+    ) -> QuerySet["NotificationModel"]:
+        queryset = NotificationModel.objects.filter(self._translate_filter(filter))
+        if order_by is None:
+            order_fields = ["-created", "-id"]
+        else:
+            attr = _ORDER_FIELD_TO_ATTR[order_by["field"]]
+            prefix = "-" if order_by["direction"] == "desc" else ""
+            # id tiebreaker in the SAME direction, so offset pagination over a non-unique key
+            # does not drop or duplicate rows across pages.
+            order_fields = [f"{prefix}{attr}", f"{prefix}id"]
+        return queryset.order_by(*order_fields)
+
+    def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        return self._serialize_notification_queryset(
+            self._paginate_queryset(self._filtered_queryset(filter, order_by), page, page_size)
+        )
+
+    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        return NotificationModel.objects.filter(self._translate_filter(filter)).count()
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        # This backend translates the full vocabulary into SQL, so it declines nothing: an empty
+        # report means every capability is supported once merged over the all-True default.
+        return {}
+
+
+def _and_all(queries: list[Q]) -> Q:
+    if not queries:
+        return Q()
+    return functools.reduce(lambda left, right: left & right, queries)
+
+
+def _or_all(queries: list[Q]) -> Q:
+    if not queries:
+        return _MATCH_NOTHING
+    return functools.reduce(lambda left, right: left | right, queries)
