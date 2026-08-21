@@ -23,6 +23,9 @@ coverage = "^7.14.1"
 django-stubs = {version = "^6.0.5", extras=["compatible-mypy"]}
 mypy = "^2.3.0"
 tox = "^4.55.0"
+# Makes the [gh] section in tox.ini effective: each CI job then runs only the
+# envs mapped to its interpreter instead of every env it can find one for.
+tox-gh = "^1.8.0"
 pytest = "^9.0.3"
 pytest-xdist = {version = "^3.6.1", extras=["psutil"]}
 pytest-cov = "^7.1.0"

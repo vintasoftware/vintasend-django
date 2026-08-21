@@ -1,5 +1,7 @@
 import os
 
+import django
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -98,4 +100,12 @@ SECRET_KEY = "6p%gef2(6kvjsgl*7!51a7z8c3=u4uc&6ulpua0g1^&sthiifp"
 
 STATIC_URL = "/static/"
 
-EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+# Django 6.1 replaced the EMAIL_* settings with MAILERS and warns on the old names.
+# Defining both raises ImproperlyConfigured, so each version gets exactly one.
+# Collapse this to the MAILERS branch once the supported Django floor reaches 6.1.
+if django.VERSION >= (6, 1):
+    MAILERS = {
+        "default": {"BACKEND": "django.core.mail.backends.locmem.EmailBackend"},
+    }
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
