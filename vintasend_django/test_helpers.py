@@ -1,9 +1,10 @@
-from django.test import TestCase
 from typing import TYPE_CHECKING
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
 
 from model_bakery import baker
 
-from django.contrib.auth import get_user_model
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser as DjangoUser

@@ -23,7 +23,8 @@ User = get_user_model()
 B = TypeVar("B", bound=BaseNotificationBackend)
 T = TypeVar("T", bound=BaseTemplatedEmailRenderer)
 
-class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
+
+class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):  # noqa: UP046
     notification_type = NotificationTypes.EMAIL
 
     def send(
@@ -47,7 +48,9 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
         bcc = [email for email in notification_settings.NOTIFICATION_DEFAULT_BCC_EMAILS] or []
 
         context_with_base_url: "NotificationContextDict" = context.copy()
-        context_with_base_url["base_url"] = f"{notification_settings.NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL}://{notification_settings.NOTIFICATION_DEFAULT_BASE_URL_DOMAIN}"
+        context_with_base_url["base_url"] = (
+            f"{notification_settings.NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL}://{notification_settings.NOTIFICATION_DEFAULT_BASE_URL_DOMAIN}"
+        )
 
         template = self.template_renderer.render(notification, context_with_base_url)
 
@@ -66,7 +69,9 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
 
         email.send()
 
-    def _get_recipient_info(self, notification: "Notification | OneOffNotification") -> dict[str, str]:
+    def _get_recipient_info(
+        self, notification: "Notification | OneOffNotification"
+    ) -> dict[str, str]:
         """Extract recipient information from notification"""
 
         if isinstance(notification, OneOffNotification):
@@ -83,7 +88,9 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
                 "full_name": "",  # Could be extended to get user's full name
             }
 
-    def _attach_files(self, email_message: EmailMessage, notification: "Notification | OneOffNotification") -> None:
+    def _attach_files(
+        self, email_message: EmailMessage, notification: "Notification | OneOffNotification"
+    ) -> None:
         """Attach a notification's stored files to the email message.
 
         Reads each ``StoredAttachment`` through its ``AttachmentFile`` handle -- the bytes may
@@ -105,5 +112,8 @@ class DjangoEmailNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T
             except Exception as e:
                 # Log error but don't break notification sending
                 import logging
-                logging.warning("Failed to attach file %s: %s", getattr(attachment, 'id', 'unknown'), e)
+
+                logging.warning(
+                    "Failed to attach file %s: %s", getattr(attachment, "id", "unknown"), e
+                )
                 continue

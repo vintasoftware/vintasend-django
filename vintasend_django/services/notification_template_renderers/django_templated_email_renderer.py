@@ -24,7 +24,7 @@ class DjangoTemplatedEmailRenderer(BaseTemplatedEmailRenderer):
         self,
         notification: "Notification | OneOffNotification",
         context: "NotificationContextDict",
-        **kwargs
+        **kwargs,
     ) -> TemplatedEmail:
         return self._render_from_templates(
             notification=notification,
@@ -39,7 +39,7 @@ class DjangoTemplatedEmailRenderer(BaseTemplatedEmailRenderer):
         notification: "Notification | OneOffNotification",
         template_content: EmailTemplateContent,
         context: "NotificationContextDict",
-        **kwargs
+        **kwargs,
     ) -> TemplatedEmail:
         """Render from supplied template content instead of the notification's stored templates.
 
@@ -67,12 +67,14 @@ class DjangoTemplatedEmailRenderer(BaseTemplatedEmailRenderer):
         # Add recipient information to context for one-off notifications
         enhanced_context = context.copy()
         if isinstance(notification, OneOffNotification):
-            enhanced_context.update({
-                'recipient_email': notification.email_or_phone,
-                'recipient_first_name': notification.first_name,
-                'recipient_last_name': notification.last_name,
-                'recipient_full_name': f"{notification.first_name} {notification.last_name}".strip(),
-            })
+            enhanced_context.update(
+                {
+                    "recipient_email": notification.email_or_phone,
+                    "recipient_first_name": notification.first_name,
+                    "recipient_last_name": notification.last_name,
+                    "recipient_full_name": f"{notification.first_name} {notification.last_name}".strip(),
+                }
+            )
 
         rendered_preheader: str | None = None
         if preheader_template:

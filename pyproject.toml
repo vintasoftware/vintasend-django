@@ -13,7 +13,7 @@ include = [
 [tool.poetry.dependencies]
 python = "<3.15,>=3.12"
 django = "<6.1,>=4.2"
-vintasend = "^2.0.0"
+vintasend = { path = "../..", develop = true }
 django-model-utils = "^5.0.0"
 
 
@@ -21,6 +21,7 @@ django-model-utils = "^5.0.0"
 freezegun = "^1.5.1"
 coverage = "^7.14.1"
 django-stubs = {version = "^6.0.5", extras=["compatible-mypy"]}
+mypy = "^2.3.0"
 tox = "^4.55.0"
 pytest = "^9.0.3"
 pytest-xdist = {version = "^3.6.1", extras=["psutil"]}
@@ -34,6 +35,11 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.mypy]
 plugins = ["mypy_django_plugin.main"]
+files = ["vintasend_django"]
+# Must track the MINIMUM Python in [tool.poetry.dependencies]. Checking against a
+# newer version hides errors that only appear on the oldest interpreter we support.
+python_version = "3.10"
+show_error_codes = true
 
 [tool.django-stubs]
 django_settings_module = "settings.test"

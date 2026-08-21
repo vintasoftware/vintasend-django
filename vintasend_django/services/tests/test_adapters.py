@@ -51,6 +51,7 @@ def _stored_attachment(data: bytes = b"payload", fail: bool = False) -> StoredAt
         file=_InMemoryAttachmentFile(data, fail=fail),
     )
 
+
 from vintasend_django.services.notification_adapters.django_email import (
     DjangoEmailNotificationAdapter,
 )
@@ -102,7 +103,9 @@ class DjangoEmailNotificationAdapterTestCase(VintaSendDjangoTestCase):
         email = mail.outbox[0]
         assert email.subject == notification.subject_template
         assert email.body == notification.body_template
-        assert email.to == ["testemail@example.com"]  # This is the email that the FakeFileBackend returns
+        assert email.to == [
+            "testemail@example.com"
+        ]  # This is the email that the FakeFileBackend returns
 
     def test_send_notification_with_render_error(self):
         user = self.create_user(email="testadapter@example.com")

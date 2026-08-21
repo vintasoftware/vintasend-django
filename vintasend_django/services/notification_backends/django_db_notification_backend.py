@@ -1,5 +1,4 @@
 import datetime
-import functools
 import uuid
 from collections.abc import Iterable
 from typing import cast
@@ -38,44 +37,13 @@ from vintasend_django.models import AttachmentFileRecord as AttachmentFileRecord
 from vintasend_django.models import Notification as NotificationModel
 from vintasend_django.models import NotificationAttachment as NotificationAttachmentModel
 from vintasend_django.services.attachment_managers.django_storage import DjangoAttachmentManager
-
-
-# Filter-field name -> notification model field, split by how each is matched. Mirrors the
-# maps in ``vintasend.services.notification_backends.filters`` so this SQL translation stays
-# faithful to the reference in-memory evaluator.
-_MEMBERSHIP_FIELDS: dict[str, str] = {
-    "status": "status",
-    "notification_type": "notification_type",
-    "adapter_used": "adapter_used",
-    "user_id": "user_id",
-    "tenant": "tenant",
-}
-_STRING_LOOKUP_FIELDS = frozenset({"body_template", "subject_template", "context_name"})
-_RANGE_FIELDS: dict[str, str] = {
-    "send_after_range": "send_after",
-    "created_at_range": "created",
-    "sent_at_range": "sent_at",
-    "read_at_range": "read_at",
-}
-# order_by field name -> model field. ``created_at`` maps to ``created`` and ``updated_at`` to
-# ``modified``, matching the model's ``AutoCreatedField`` / ``AutoLastModifiedField``.
-_ORDER_FIELD_TO_ATTR: dict[str, str] = {
-    "send_after": "send_after",
-    "sent_at": "sent_at",
-    "read_at": "read_at",
-    "created_at": "created",
-    "updated_at": "modified",
-}
-# Django lookup suffixes for each string lookup, case-sensitive first / case-insensitive second.
-_STRING_LOOKUP_SUFFIX: dict[str, tuple[str, str]] = {
-    "exact": ("exact", "iexact"),
-    "starts_with": ("startswith", "istartswith"),
-    "ends_with": ("endswith", "iendswith"),
-    "includes": ("contains", "icontains"),
-}
-# A Q that matches no row, used for an unknown filter field (the reference evaluator treats an
-# unknown field as non-matching) and for ``not {}`` (negating the match-everything empty filter).
-_MATCH_NOTHING = Q(pk__in=[])
+from vintasend_django.services.notification_backends.filters import (
+    MATCH_NOTHING,
+    ORDER_FIELD_TO_ATTR,
+    and_all,
+    field_leaf,
+    or_all,
+)
 
 
 class DjangoDbNotificationBackend(BaseNotificationBackend):
@@ -135,7 +103,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     ) -> Iterable[Notification | OneOffNotification]:
         return (self.serialize_notification(n) for n in queryset.iterator())
 
-    def serialize_notification(self, notification: NotificationModel) -> Notification | OneOffNotification:
+    def serialize_notification(
+        self, notification: NotificationModel
+    ) -> Notification | OneOffNotification:
         if notification.user_id:
             return self.serialize_user_notification(notification)
         return self.serialize_one_off_notification(notification)
@@ -165,6 +135,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             read_at=notification.read_at,
             tenant=notification.tenant,
             git_commit_sha=notification.git_commit_sha,
+            requested_template_version=notification.requested_template_version,
+            used_template_version=notification.used_template_version,
             attachments=list(self.get_attachments(notification.pk)),
         )
 
@@ -193,6 +165,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             read_at=notification.read_at,
             tenant=notification.tenant,
             git_commit_sha=notification.git_commit_sha,
+            requested_template_version=notification.requested_template_version,
+            used_template_version=notification.used_template_version,
             attachments=list(self.get_attachments(notification.pk)),
         )
 
@@ -265,9 +239,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
                     description=attachment.description,
                     is_inline=attachment.is_inline,
                 )
-                stored_attachments.append(
-                    self._stored_attachment_from_join_row(join_row, record)
-                )
+                stored_attachments.append(self._stored_attachment_from_join_row(join_row, record))
                 continue
 
             # TypeGuard narrows only the reference branch, so restate the upload type.
@@ -330,9 +302,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
                 is_inline=attachment.is_inline,
             )
 
-    def store_attachment_file_record(
-        self, record: AttachmentFileRecord
-    ) -> AttachmentFileRecord:
+    def store_attachment_file_record(self, record: AttachmentFileRecord) -> AttachmentFileRecord:
         instance = AttachmentFileRecordModel.objects.create(
             filename=record.filename,
             content_type=record.content_type or "",
@@ -352,9 +322,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     def find_attachment_file_by_checksum(
         self, checksum: str, size: int
     ) -> AttachmentFileRecord | None:
-        instance = AttachmentFileRecordModel.objects.filter(
-            checksum=checksum, size=size
-        ).first()
+        instance = AttachmentFileRecordModel.objects.filter(checksum=checksum, size=size).first()
         if instance is None:
             return None
         return self._serialize_file_record(instance)
@@ -373,9 +341,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         orphaned = AttachmentFileRecordModel.objects.filter(notification_attachments__isnull=True)
         return [self._serialize_file_record(record) for record in orphaned.iterator()]
 
-    def get_attachments(
-        self, notification_id: int | str | uuid.UUID
-    ) -> Iterable[StoredAttachment]:
+    def get_attachments(self, notification_id: int | str | uuid.UUID) -> Iterable[StoredAttachment]:
         join_rows = NotificationAttachmentModel.objects.filter(
             notification_id=str(notification_id)
         ).select_related("file")
@@ -409,6 +375,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> Notification:
         notification_instance = NotificationModel.objects.create(
             user_id=str(user_id),
@@ -422,6 +389,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             preheader_template=preheader_template or "",
             adapter_extra_parameters=adapter_extra_parameters,
             tenant=tenant,
+            requested_template_version=requested_template_version,
         )
 
         if attachments:
@@ -445,6 +413,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> OneOffNotification:
         """Create and store a one-off notification"""
 
@@ -463,6 +432,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             preheader_template=preheader_template or "",
             adapter_extra_parameters=adapter_extra_parameters,
             tenant=tenant,
+            requested_template_version=requested_template_version,
         )
 
         if attachments:
@@ -476,9 +446,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         # ``attachments`` is not a scalar column; it is a set of already-stored files to link
         # via join rows (the resend path), so pull it out before the row ``update``.
         update_data = dict(updated_data)
-        attachments = cast(
-            "list[StoredAttachment] | None", update_data.pop("attachments", None)
-        )
+        attachments = cast("list[StoredAttachment] | None", update_data.pop("attachments", None))
 
         pending = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
@@ -499,7 +467,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_pending_as_sent(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
         ).update(status=NotificationStatus.SENT.value, sent_at=timezone.now())
@@ -507,7 +477,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_pending_as_failed(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
         ).update(status=NotificationStatus.FAILED.value)
@@ -515,7 +487,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_sent_as_read(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.SENT.value
         ).update(status=NotificationStatus.READ.value, read_at=timezone.now())
@@ -547,14 +521,18 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         # Check if it's a one-off notification (no user) or regular notification
         return self.serialize_notification(notification_instance)
 
-    def _get_one_off_notification(self, notification_id: int | str | uuid.UUID) -> OneOffNotification:
+    def _get_one_off_notification(
+        self, notification_id: int | str | uuid.UUID
+    ) -> OneOffNotification:
         """Retrieve one-off notification from storage"""
         try:
             notification_instance = NotificationModel.objects.exclude(
                 status=NotificationStatus.CANCELLED.value
             ).get(id=str(notification_id), user__isnull=True)
         except NotificationModel.DoesNotExist as e:
-            raise NotificationNotFoundError(f"One-off notification {notification_id} not found") from e
+            raise NotificationNotFoundError(
+                f"One-off notification {notification_id} not found"
+            ) from e
 
         return self.serialize_one_off_notification(notification_instance)
 
@@ -573,7 +551,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
         return all_notifications
 
-    def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
+    def get_pending_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable[Notification | OneOffNotification]:
         return self._serialize_notification_queryset(
             self._paginate_queryset(
                 self._get_all_pending_notifications_queryset(),
@@ -668,7 +648,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         return self._serialize_notification_queryset(self._get_all_future_notifications_queryset())
 
-    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification | OneOffNotification"]:
+    def get_future_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable["Notification | OneOffNotification"]:
         return self._serialize_notification_queryset(
             self._paginate_queryset(self._get_all_future_notifications_queryset(), page, page_size)
         )
@@ -718,50 +700,27 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             git_commit_sha=git_commit_sha
         )
 
-    # ------------------------------------------------------------------ filtering
-
-    def _string_lookup_q(self, model_field: str, spec: object) -> Q:
-        if isinstance(spec, dict):
-            lookup = spec.get("lookup", "exact")
-            value = spec.get("value", "")
-            case_sensitive = spec.get("case_sensitive", True)
-        else:
-            lookup = "exact"
-            value = spec
-            case_sensitive = True
-        sensitive_suffix, insensitive_suffix = _STRING_LOOKUP_SUFFIX.get(
-            lookup, _STRING_LOOKUP_SUFFIX["exact"]
+    def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+    ) -> None:
+        # Overridden rather than inherited: the seam's default is a no-op so a backend with
+        # nowhere to put this keeps working, and there is a column for it here.
+        NotificationModel.objects.filter(id=str(notification_id)).update(
+            used_template_version=template_version
         )
-        suffix = sensitive_suffix if case_sensitive else insensitive_suffix
-        return Q(**{f"{model_field}__{suffix}": value})
 
-    def _range_q(self, model_field: str, spec: object) -> Q:
-        query = Q()
-        if not isinstance(spec, dict):
-            return query
-        lower = spec.get("from")
-        upper = spec.get("to")
-        if lower is not None:
-            query &= Q(**{f"{model_field}__gte": lower})
-        if upper is not None:
-            query &= Q(**{f"{model_field}__lte": upper})
-        return query
+    # ------------------------------------------------------------------ filtering
 
     def _field_leaf(self, field: str, value: object) -> tuple[Q, str | None]:
         """Positive Q for one field filter, plus the model field to OR ``__isnull`` on when
-        this leaf is negated. Returns the match-nothing Q (and no null field) for an unknown
-        field, mirroring the reference evaluator's "unknown field never matches"."""
-        if field in _RANGE_FIELDS:
-            model_field = _RANGE_FIELDS[field]
-            return self._range_q(model_field, value), model_field
-        if field in _STRING_LOOKUP_FIELDS:
-            return self._string_lookup_q(field, value), field
-        if field in _MEMBERSHIP_FIELDS:
-            model_field = _MEMBERSHIP_FIELDS[field]
-            values = value if isinstance(value, (list, tuple, set)) else [value]
-            normalized = [v.value if hasattr(v, "value") else v for v in values]
-            return Q(**{f"{model_field}__in": normalized}), model_field
-        return _MATCH_NOTHING, None
+        this leaf is negated.
+
+        Delegates to :mod:`vintasend_django.services.notification_backends.filters`; a subclass
+        that adds filter fields overrides this and falls back to ``super()`` for the rest.
+        """
+        return field_leaf(field, value)
 
     def _translate_filter(self, filter: NotificationFilter, negated: bool = False) -> Q:  # noqa: A002
         """Translate a composable filter to a Django ``Q``, pushing negation to the leaves.
@@ -773,11 +732,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         """
         if "and" in filter:
             subs = [self._translate_filter(sub, negated) for sub in filter["and"]]  # type: ignore[typeddict-item]
-            combiner = _or_all if negated else _and_all  # De Morgan under negation
+            combiner = or_all if negated else and_all  # De Morgan under negation
             return combiner(subs)
         if "or" in filter:
             subs = [self._translate_filter(sub, negated) for sub in filter["or"]]  # type: ignore[typeddict-item]
-            combiner = _and_all if negated else _or_all
+            combiner = and_all if negated else or_all
             return combiner(subs)
         if "not" in filter:
             return self._translate_filter(filter["not"], not negated)  # type: ignore[typeddict-item]
@@ -785,10 +744,10 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         # Field filter. Empty ``{}`` matches everything (or nothing when negated). Multiple keys
         # are an implicit AND (OR under negation, by De Morgan).
         if not is_field_filter(filter):
-            return _MATCH_NOTHING if not negated else Q()
+            return MATCH_NOTHING if not negated else Q()
         items = list(filter.items())
         if not items:
-            return _MATCH_NOTHING if negated else Q()
+            return MATCH_NOTHING if negated else Q()
         leaf_qs: list[Q] = []
         for key, value in items:
             positive_q, null_field = self._field_leaf(key, value)
@@ -799,7 +758,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
                 if null_field is not None:
                     negated_q |= Q(**{f"{null_field}__isnull": True})
                 leaf_qs.append(negated_q)
-        return _or_all(leaf_qs) if negated else _and_all(leaf_qs)
+        return or_all(leaf_qs) if negated else and_all(leaf_qs)
 
     def _filtered_queryset(
         self,
@@ -810,7 +769,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         if order_by is None:
             order_fields = ["-created", "-id"]
         else:
-            attr = _ORDER_FIELD_TO_ATTR[order_by["field"]]
+            attr = ORDER_FIELD_TO_ATTR[order_by["field"]]
             prefix = "-" if order_by["direction"] == "desc" else ""
             # id tiebreaker in the SAME direction, so offset pagination over a non-unique key
             # does not drop or duplicate rows across pages.
@@ -835,15 +794,3 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         # This backend translates the full vocabulary into SQL, so it declines nothing: an empty
         # report means every capability is supported once merged over the all-True default.
         return {}
-
-
-def _and_all(queries: list[Q]) -> Q:
-    if not queries:
-        return Q()
-    return functools.reduce(lambda left, right: left & right, queries)
-
-
-def _or_all(queries: list[Q]) -> Q:
-    if not queries:
-        return _MATCH_NOTHING
-    return functools.reduce(lambda left, right: left | right, queries)

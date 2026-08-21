@@ -1,6 +1,7 @@
-from vintasend.constants import NotificationStatus, NotificationTypes
-from django.utils.translation import gettext_lazy as _
 from django.db.models import TextChoices
+from django.utils.translation import gettext_lazy as _
+
+from vintasend.constants import NotificationStatus, NotificationTypes
 
 
 class NotificationStatusChoices(TextChoices):

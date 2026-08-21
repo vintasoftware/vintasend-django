@@ -429,9 +429,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         already_read = self._make_notification(self.user, NotificationStatus.READ)
 
         # Must not raise (single mark_sent_as_read would).
-        results = list(
-            DjangoDbNotificationBackend().mark_sent_as_read_bulk([already_read.pk])
-        )
+        results = list(DjangoDbNotificationBackend().mark_sent_as_read_bulk([already_read.pk]))
 
         assert [n.id for n in results] == [already_read.pk]
 
@@ -686,9 +684,15 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         regular_found = False
         one_off_found = False
         for notification in all_pending:
-            if isinstance(notification, Notification) and notification.id == regular_notification.id:
+            if (
+                isinstance(notification, Notification)
+                and notification.id == regular_notification.id
+            ):
                 regular_found = True
-            elif isinstance(notification, OneOffNotification) and notification.id == one_off_notification.id:
+            elif (
+                isinstance(notification, OneOffNotification)
+                and notification.id == one_off_notification.id
+            ):
                 one_off_found = True
 
         assert regular_found, "Regular notification not found in pending notifications"
@@ -779,6 +783,75 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         reloaded = backend.get_notification(notification.id)
         assert reloaded.git_commit_sha == sha
 
+    # --------------------------------------------------------------- template versions
+
+    def test_persist_notification_records_the_requested_template_version(self):
+        backend = DjangoDbNotificationBackend()
+
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Pinned",
+            body_template="welcome",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            requested_template_version=3,
+        )
+
+        assert notification.requested_template_version == 3
+        assert backend.get_notification(notification.id).requested_template_version == 3
+
+    def test_a_notification_with_no_pin_stores_null(self):
+        backend = DjangoDbNotificationBackend()
+
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Unpinned",
+            body_template="welcome",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+
+        assert notification.requested_template_version is None
+        assert NotificationModel.objects.get(id=notification.id).requested_template_version is None
+
+    def test_store_template_version(self):
+        backend = DjangoDbNotificationBackend()
+        notification = backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Version title",
+            body_template="welcome",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+        )
+
+        backend.store_template_version(notification.id, 5)
+
+        assert backend.get_notification(notification.id).used_template_version == 5
+
+    def test_a_one_off_notification_records_the_requested_template_version(self):
+        backend = DjangoDbNotificationBackend()
+
+        notification = backend.persist_one_off_notification(
+            email_or_phone="someone@example.com",
+            first_name="Some",
+            last_name="One",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Pinned one-off",
+            body_template="welcome",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            requested_template_version=2,
+        )
+
+        assert notification.requested_template_version == 2
+
     # --------------------------------------------------------------- attachments
 
     def test_persist_notification_with_attachment(self):
@@ -801,9 +874,9 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         assert stored.size == len(b"hello world")
         assert stored.file.read() == b"hello world"
         assert AttachmentFileRecordModel.objects.count() == 1
-        assert NotificationAttachmentModel.objects.filter(
-            notification_id=notification.id
-        ).count() == 1
+        assert (
+            NotificationAttachmentModel.objects.filter(notification_id=notification.id).count() == 1
+        )
 
     def test_persist_one_off_notification_with_attachment(self):
         backend = DjangoDbNotificationBackend()
@@ -996,6 +1069,65 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         )
         assert len(results) == 1
         assert results[0].notification_type == NotificationTypes.IN_APP.value
+
+    def test_filter_notifications_by_template_version(self):
+        """Which notifications are pinned to a given version, and which rendered one."""
+        backend = DjangoDbNotificationBackend()
+        pinned = self._make(backend, requested_template_version=3)
+        self._make(backend, requested_template_version=4)
+        backend.store_template_version(pinned.id, 3)
+
+        requested = list(
+            backend.filter_notifications({"requested_template_version": 3}, page=1, page_size=10)
+        )
+        assert [n.id for n in requested] == [pinned.id]
+
+        used = list(
+            backend.filter_notifications({"used_template_version": 3}, page=1, page_size=10)
+        )
+        assert [n.id for n in used] == [pinned.id]
+
+    def test_filter_notifications_by_a_list_of_template_versions(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, requested_template_version=1)
+        self._make(backend, requested_template_version=2)
+        self._make(backend, requested_template_version=9)
+
+        results = list(
+            backend.filter_notifications(
+                {"requested_template_version": [1, 2]}, page=1, page_size=10
+            )
+        )
+        assert len(results) == 2
+        assert backend.count_notifications({"requested_template_version": [1, 2]}) == 2
+
+    def test_an_unpinned_notification_does_not_match_a_version_filter(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend)
+
+        assert backend.count_notifications({"requested_template_version": 1}) == 0
+
+    def test_negating_a_version_filter_includes_the_unpinned_rows(self):
+        """The library's NULL semantics, in SQL: ``NOT IN`` would drop the NULLs."""
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, requested_template_version=1)
+        self._make(backend, requested_template_version=2)
+        self._make(backend)  # never pinned
+
+        results = list(
+            backend.filter_notifications(
+                {"not": {"requested_template_version": 1}}, page=1, page_size=10
+            )
+        )
+        assert len(results) == 2
+
+    def test_a_non_integer_version_candidate_matches_nothing_rather_than_raising(self):
+        """A stringified version would raise out of Django's int coercion if forwarded."""
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, requested_template_version=3)
+
+        assert backend.count_notifications({"requested_template_version": "3"}) == 0
+        assert backend.count_notifications({"requested_template_version": [3, "x"]}) == 0
 
     def test_filter_notifications_string_lookup(self):
         backend = DjangoDbNotificationBackend()
@@ -1232,9 +1364,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         )
         backend.mark_pending_as_sent(sent.id)
         with pytest.raises(NotificationUpdateError):
-            backend.persist_notification_update(
-                sent.id, {"attachments": list(source.attachments)}
-            )
+            backend.persist_notification_update(sent.id, {"attachments": list(source.attachments)})
 
     def test_persist_notification_update_unknown_stored_attachment_raises(self):
         from vintasend.services.dataclasses import StoredAttachment
@@ -1256,7 +1386,9 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
             size=1,
             checksum="x",
             created_at=timezone.now(),
-            file=backend._attachment_manager.reconstruct_attachment_file({"id": "missing", "name": "missing"}),
+            file=backend._attachment_manager.reconstruct_attachment_file(
+                {"id": "missing", "name": "missing"}
+            ),
             file_id="999999",
         )
         with pytest.raises(AttachmentFileNotFoundError):
@@ -1294,7 +1426,107 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         self._make(backend)
         assert list(backend.filter_notifications({"nope": "x"}, page=1, page_size=10)) == []
         # Under negation an unknown field matches everything.
-        assert len(list(backend.filter_notifications({"not": {"nope": "x"}}, page=1, page_size=10))) == 1
+        assert (
+            len(list(backend.filter_notifications({"not": {"nope": "x"}}, page=1, page_size=10)))
+            == 1
+        )
+
+    def test_filter_notifications_choice_accepts_member_or_wire_value(self):
+        backend = DjangoDbNotificationBackend()
+        email = self._make(backend, notification_type=NotificationTypes.EMAIL.value)
+        self._make(backend, notification_type=NotificationTypes.IN_APP.value)
+        by_member = list(
+            backend.filter_notifications(
+                {"notification_type": NotificationTypes.EMAIL}, page=1, page_size=10
+            )
+        )
+        by_wire_value = list(
+            backend.filter_notifications(
+                {"notification_type": [NotificationTypes.EMAIL.value]}, page=1, page_size=10
+            )
+        )
+        assert [str(n.id) for n in by_member] == [str(email.id)]
+        assert [str(n.id) for n in by_wire_value] == [str(email.id)]
+
+    def test_filter_notifications_unknown_choice_matches_nothing(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend)
+        # A status the enum does not define never reaches SQL.
+        assert list(backend.filter_notifications({"status": "BOGUS"}, page=1, page_size=10)) == []
+        # One bad candidate rejects the whole leaf, it does not degrade to the good ones.
+        mixed = {"status": [NotificationStatus.PENDING_SEND.value, "BOGUS"]}
+        assert list(backend.filter_notifications(mixed, page=1, page_size=10)) == []
+        # A member of an unrelated enum is not a status either.
+        wrong_enum = {"status": NotificationTypes.EMAIL}
+        assert list(backend.filter_notifications(wrong_enum, page=1, page_size=10)) == []
+
+    def test_filter_notifications_malformed_string_lookup_matches_nothing(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, body_template="body_a")
+        unknown_lookup = {"body_template": {"lookup": "regex", "value": "body"}}
+        assert list(backend.filter_notifications(unknown_lookup, page=1, page_size=10)) == []
+        # A lookup with no needle would match every row, so it is rejected instead.
+        no_value = {"body_template": {"lookup": "includes"}}
+        assert list(backend.filter_notifications(no_value, page=1, page_size=10)) == []
+
+    def test_filter_notifications_case_insensitive_string_lookup(self):
+        backend = DjangoDbNotificationBackend()
+        match = self._make(backend, body_template="Welcome_Email")
+        self._make(backend, body_template="goodbye_email")
+        results = list(
+            backend.filter_notifications(
+                {
+                    "body_template": {
+                        "lookup": "starts_with",
+                        "value": "welcome",
+                        "case_sensitive": False,
+                    }
+                },
+                page=1,
+                page_size=10,
+            )
+        )
+        assert [str(n.id) for n in results] == [str(match.id)]
+
+    def test_filter_notifications_unbounded_date_range_excludes_null_rows(self):
+        backend = DjangoDbNotificationBackend()
+        scheduled = self._make(backend, send_after=timezone.now())
+        self._make(backend, send_after=None)
+        # A range filter never matches a NULL, even with no bounds to compare against.
+        results = list(backend.filter_notifications({"send_after_range": {}}, page=1, page_size=10))
+        assert [str(n.id) for n in results] == [str(scheduled.id)]
+
+    def test_filter_notifications_malformed_date_range_matches_nothing(self):
+        backend = DjangoDbNotificationBackend()
+        self._make(backend, send_after=timezone.now())
+        # A bound that is not a datetime, and a typo'd bound that would silently widen the
+        # range to unbounded, both reject the leaf.
+        assert (
+            list(
+                backend.filter_notifications(
+                    {"send_after_range": {"to": "2026-01-01"}}, page=1, page_size=10
+                )
+            )
+            == []
+        )
+        assert (
+            list(
+                backend.filter_notifications(
+                    {"send_after_range": {"form": timezone.now()}}, page=1, page_size=10
+                )
+            )
+            == []
+        )
+
+    def test_filter_notifications_membership_list(self):
+        backend = DjangoDbNotificationBackend()
+        acme = self._make(backend, tenant="acme")
+        globex = self._make(backend, tenant="globex")
+        self._make(backend, tenant="initech")
+        results = list(
+            backend.filter_notifications({"tenant": ["acme", "globex"]}, page=1, page_size=10)
+        )
+        assert {str(n.id) for n in results} == {str(acme.id), str(globex.id)}
 
     def test_filter_notifications_empty_logical_groups(self):
         backend = DjangoDbNotificationBackend()

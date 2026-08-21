@@ -1,5 +1,7 @@
 import uuid
-from typing import TYPE_CHECKING 
+from typing import TYPE_CHECKING
+
+from django.contrib.auth import get_user_model
 
 import pytest
 from vintasend.constants import NotificationStatus, NotificationTypes
@@ -12,11 +14,11 @@ from vintasend.services.dataclasses import Notification
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     EmailTemplateContent,
 )
+
 from vintasend_django.services.notification_template_renderers.django_templated_email_renderer import (
     DjangoTemplatedEmailRenderer,
 )
 from vintasend_django.test_helpers import VintaSendDjangoTestCase
-from django.contrib.auth import get_user_model
 
 
 if TYPE_CHECKING:

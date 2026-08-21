@@ -23,7 +23,9 @@ class BackfillAttachmentChecksumsCommandTest(VintaSendDjangoTestCase):
         shutil.rmtree(self._media_root, ignore_errors=True)
         super().tearDown()
 
-    def _record_without_checksum(self, data: bytes, filename: str = "f.txt") -> AttachmentFileRecord:
+    def _record_without_checksum(
+        self, data: bytes, filename: str = "f.txt"
+    ) -> AttachmentFileRecord:
         # Store real bytes through the manager, then persist a record with an empty checksum,
         # mimicking what the 0005 data migration leaves behind.
         file_record = self.manager.upload_file(data, filename, "text/plain")

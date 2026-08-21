@@ -9,7 +9,10 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase, override_settings
 
 
-MIGRATE_FROM = ("vintasend_django", "0004_notification_git_commit_sha_notification_read_at_and_more")
+MIGRATE_FROM = (
+    "vintasend_django",
+    "0004_notification_git_commit_sha_notification_read_at_and_more",
+)
 MIGRATE_TO = ("vintasend_django", "0006_delete_attachment")
 
 

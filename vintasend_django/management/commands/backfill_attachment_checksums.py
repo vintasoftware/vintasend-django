@@ -115,9 +115,7 @@ class Command(BaseCommand):
 
             # Bypass the model's save() so AutoLastModifiedField does not churn ``modified`` on a
             # pure metadata backfill; only checksum and size change.
-            AttachmentFileRecord.objects.filter(pk=record.pk).update(
-                checksum=checksum, size=size
-            )
+            AttachmentFileRecord.objects.filter(pk=record.pk).update(checksum=checksum, size=size)
             updated += 1
 
         verb = "Would update" if dry_run else "Updated"

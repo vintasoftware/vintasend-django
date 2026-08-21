@@ -10,6 +10,7 @@ from vintasend_django.constants import NotificationStatusChoices, NotificationTy
 
 User = get_user_model()
 
+
 class Notification(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     email_or_phone = models.CharField(max_length=255, blank=True)
@@ -18,7 +19,9 @@ class Notification(models.Model):
     notification_type = models.CharField(max_length=50, choices=NotificationTypesChoices)
     title = models.CharField(max_length=255)
     status = models.CharField(
-        max_length=50, choices=NotificationStatusChoices, default=NotificationStatusChoices.PENDING_SEND
+        max_length=50,
+        choices=NotificationStatusChoices,
+        default=NotificationStatusChoices.PENDING_SEND,
     )
     body_template = models.CharField(max_length=255)
 
@@ -48,13 +51,36 @@ class Notification(models.Model):
     # ``null=True`` so an unresolved SHA is None, matching the dataclass field, not "".
     git_commit_sha = models.CharField(_("git commit sha"), max_length=40, null=True, blank=True)  # noqa: DJ001
 
+    # Which version of ``body_template`` this notification renders, for a template renderer
+    # whose templates are versioned (a store-backed one -- a file on disk has no version).
+    # NULL means "whatever is current at send time", which is how a notification behaves
+    # unless a version was passed on create/update or the service was built with
+    # ``pin_template_versions=True``. Set once, at creation; never moved afterwards except by
+    # an update that repoints the notification at another template.
+    requested_template_version = models.PositiveIntegerField(
+        _("requested template version"), null=True, blank=True
+    )
+    # System-managed: written only by NotificationService (through the backend's
+    # ``store_template_version``) at send time, from the version the renderer reported it
+    # actually used. On an unpinned notification this is the only record of which version went
+    # out, since the template has moved on by the time anyone asks.
+    used_template_version = models.PositiveIntegerField(
+        _("used template version"), null=True, blank=True
+    )
+
     created = AutoCreatedField(_("created"), db_index=True)
     modified = AutoLastModifiedField(_("modified"), db_index=True)
 
-    adapter_extra_parameters = models.JSONField(_("extra parameters for the notification adapter"), null=True, encoder=DjangoJSONEncoder)
+    adapter_extra_parameters = models.JSONField(
+        _("extra parameters for the notification adapter"), null=True, encoder=DjangoJSONEncoder
+    )
 
-    context_used = models.JSONField(_("context used when notification was sent"), null=True, encoder=DjangoJSONEncoder)
-    adapter_used = models.CharField(_("adapter used to send the notification"), max_length=255, blank=True)
+    context_used = models.JSONField(
+        _("context used when notification was sent"), null=True, encoder=DjangoJSONEncoder
+    )
+    adapter_used = models.CharField(
+        _("adapter used to send the notification"), max_length=255, blank=True
+    )
 
     objects: models.Manager["Notification"]
 
