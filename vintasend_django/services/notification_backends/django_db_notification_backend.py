@@ -7,11 +7,19 @@ from django.db import transaction
 from django.db.models import Q, QuerySet
 from django.utils import timezone
 
-from vintasend.constants import NotificationStatus, NotificationTypes
+from vintasend.constants import (
+    REPINNABLE_NOTIFICATION_STATUSES,
+    REQUEUEABLE_NOTIFICATION_STATUSES,
+    UNSET,
+    NotificationStatus,
+    NotificationTypes,
+    UnsetType,
+)
 from vintasend.exceptions import (
     AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
+    NotificationRequeueError,
     NotificationUpdateError,
     NotificationUserNotFoundError,
 )
@@ -441,18 +449,20 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         return self.serialize_one_off_notification(notification_instance)
 
     def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
+        self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs
     ) -> Notification | OneOffNotification:
         # ``attachments`` is not a scalar column; it is a set of already-stored files to link
         # via join rows (the resend path), so pull it out before the row ``update``.
-        update_data = dict(updated_data)
-        attachments = cast("list[StoredAttachment] | None", update_data.pop("attachments", None))
+        values = dict(update_data)
+        attachments = cast("list[StoredAttachment] | None", values.pop("attachments", None))
 
+        # A notification that did not go out can be updated: repin_notification moves the pin
+        # on FAILED and CANCELLED notifications too. A delivered one cannot.
         pending = NotificationModel.objects.filter(
-            id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
+            id=str(notification_id), status__in=REPINNABLE_NOTIFICATION_STATUSES
         )
-        if update_data:
-            records_updated = pending.update(**update_data)
+        if values:
+            records_updated = pending.update(**values)
             if records_updated == 0:
                 raise NotificationUpdateError(
                     "Failed to update notification, it may have already been sent"
@@ -505,11 +515,44 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         if records_updated == 0:
             raise NotificationCancelError("Failed to delete notification")
 
+    def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> Notification | OneOffNotification:
+        """Put a FAILED or CANCELLED notification back into PENDING_SEND.
+
+        The status check is part of the UPDATE's WHERE clause, so a notification another caller
+        requeued first, or a worker sent in the meantime, is refused rather than overwritten.
+        """
+        values: dict[str, object] = {
+            "status": NotificationStatus.PENDING_SEND.value,
+            "sent_at": None,
+            "modified": timezone.now(),
+        }
+        if send_after is not UNSET:
+            values["send_after"] = send_after
+
+        records_updated = NotificationModel.objects.filter(
+            id=str(notification_id), status__in=REQUEUEABLE_NOTIFICATION_STATUSES
+        ).update(**values)
+        if records_updated == 0:
+            if not NotificationModel.objects.filter(id=str(notification_id)).exists():
+                raise NotificationNotFoundError(f"Notification {notification_id} not found")
+            raise NotificationRequeueError(
+                f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
+            )
+        return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
+
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
     ) -> Notification | OneOffNotification:
-        """Get notification by ID, supporting both regular and one-off notifications"""
-        queryset = NotificationModel.objects.exclude(status=NotificationStatus.CANCELLED.value)
+        """Get notification by ID, supporting both regular and one-off notifications.
+
+        A cancelled notification is returned too, with status CANCELLED, so it can be read and
+        requeued. ``filter_notifications`` lists cancelled notifications the same way.
+        """
+        queryset = NotificationModel.objects.all()
 
         if for_update:
             queryset = queryset.select_for_update()
@@ -526,9 +569,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     ) -> OneOffNotification:
         """Retrieve one-off notification from storage"""
         try:
-            notification_instance = NotificationModel.objects.exclude(
-                status=NotificationStatus.CANCELLED.value
-            ).get(id=str(notification_id), user__isnull=True)
+            notification_instance = NotificationModel.objects.get(
+                id=str(notification_id), user__isnull=True
+            )
         except NotificationModel.DoesNotExist as e:
             raise NotificationNotFoundError(
                 f"One-off notification {notification_id} not found"
