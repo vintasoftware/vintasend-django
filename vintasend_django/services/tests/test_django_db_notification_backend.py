@@ -1206,8 +1206,14 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         )
         assert [str(n.id) for n in results] == [str(past.id)]
 
-    def test_get_filter_capabilities_is_empty(self):
-        assert DjangoDbNotificationBackend().get_filter_capabilities() == {}
+    def test_get_filter_capabilities_reports_the_presence_filters(self):
+        # Every other key is supported by default; the presence filters default to False.
+        assert DjangoDbNotificationBackend().get_filter_capabilities() == {
+            "fields.hasSendAfter": True,
+            "negation.hasSendAfter": True,
+            "fields.hasRequestedTemplateVersion": True,
+            "negation.hasRequestedTemplateVersion": True,
+        }
 
     # --------------------------------------------------------------- resend attachment path
 
@@ -1719,7 +1725,8 @@ class DjangoDbRequeueNotificationTestCase(VintaSendDjangoTestCase):
 
         requeued = service.requeue_notification(notification.id, send_after=None)
 
-        assert requeued.status == NotificationStatus.PENDING_SEND.value
+        # The service returns the notification as it stands after the send it started.
+        assert requeued.status == NotificationStatus.SENT.value
         assert NotificationModel.objects.get(id=notification.id).status == (
             NotificationStatus.SENT.value
         )

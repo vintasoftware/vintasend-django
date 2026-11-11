@@ -19,9 +19,11 @@ from vintasend.exceptions import (
     AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
+    NotificationRepinError,
     NotificationRequeueError,
     NotificationUpdateError,
     NotificationUserNotFoundError,
+    NotificationVersionChangedError,
 )
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.dataclasses import (
@@ -29,6 +31,7 @@ from vintasend.services.dataclasses import (
     AttachmentFileRecord,
     Notification,
     NotificationAttachment,
+    NotificationVersion,
     OneOffNotification,
     StoredAttachment,
     UpdateNotificationKwargs,
@@ -44,6 +47,7 @@ from vintasend.services.notification_backends.filters import (
 from vintasend_django.models import AttachmentFileRecord as AttachmentFileRecordModel
 from vintasend_django.models import Notification as NotificationModel
 from vintasend_django.models import NotificationAttachment as NotificationAttachmentModel
+from vintasend_django.models import new_notification_version
 from vintasend_django.services.attachment_managers.django_storage import DjangoAttachmentManager
 from vintasend_django.services.notification_backends.filters import (
     MATCH_NOTHING,
@@ -54,7 +58,60 @@ from vintasend_django.services.notification_backends.filters import (
 )
 
 
+# The presence filters default to unsupported in vintasend; this backend evaluates them.
+PRESENCE_FILTER_CAPABILITIES: dict[str, bool] = {
+    "fields.hasSendAfter": True,
+    "negation.hasSendAfter": True,
+    "fields.hasRequestedTemplateVersion": True,
+    "negation.hasRequestedTemplateVersion": True,
+}
+ACTION_CAPABILITIES: dict[str, bool] = {
+    "repin.expectedVersion": True,
+    "requeue.expectedVersion": True,
+    "requeue.templateVersion": True,
+    "versions.filter": True,
+}
+
+
+def _changed_error(
+    action: str, notification_id: int | str | uuid.UUID
+) -> NotificationVersionChangedError:
+    return NotificationVersionChangedError(
+        f"Cannot {action} notification {notification_id}: it changed since that version was read"
+    )
+
+
+def _parse_expected_version(expected_version: object) -> uuid.UUID | None:
+    """The ``notification_version`` an ``expected_version`` names, or ``None`` when none was given.
+
+    Tokens are handed out as ``str(uuid)``. Anything else (a malformed string, a non-string, or
+    the empty string listed for a row with no token yet) is a token this backend could not have
+    handed out. It becomes a fresh token no row holds rather than an error here, so the
+    conditional UPDATE matches nothing and the refusal read reports not-found before changed,
+    the same order as a well-formed token that no longer matches.
+    """
+    if expected_version is None:
+        return None
+    if not isinstance(expected_version, str):
+        return new_notification_version()
+    try:
+        parsed = uuid.UUID(expected_version)
+    except ValueError:
+        return new_notification_version()
+    if str(parsed) != expected_version:
+        return new_notification_version()
+    return parsed
+
+
 class DjangoDbNotificationBackend(BaseNotificationBackend):
+    """Notifications stored in the ``vintasend_django`` models through the Django ORM.
+
+    Every write to a notification row sets a fresh ``notification_version`` (a UUIDv7), the
+    token ``filter_notification_versions`` hands out and ``requeue_notification`` /
+    ``repin_notification`` check as ``expected_version``. ``QuerySet.update()`` does not run
+    ``save()`` or field defaults, so every ``update()`` here sets it explicitly.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Default to a Django-storage-backed manager so the backend is usable standalone; the
@@ -284,6 +341,25 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
 
         return stored_attachments
 
+    def _store_attachments_and_move_version(
+        self,
+        attachments: list[AnyNotificationAttachment],
+        notification_id: int | str | uuid.UUID,
+    ) -> list[StoredAttachment]:
+        """``_store_attachments`` for a just-created row, then move its version token once.
+
+        Linking attachments changes the notification, so, as everywhere else, it moves the token:
+        the one the row was created with may already have been listed. One transaction, so a link
+        that fails leaves neither join rows nor a moved token behind.
+        """
+        with transaction.atomic():
+            stored = self._store_attachments(attachments, notification_id)
+            if stored:
+                NotificationModel.objects.filter(id=str(notification_id)).update(
+                    notification_version=new_notification_version()
+                )
+        return stored
+
     def _attach_stored_attachments(
         self,
         notification_id: int | str | uuid.UUID,
@@ -364,8 +440,17 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         Drops only the join row, never the ``AttachmentFileRecord`` or its bytes -- a file
         may still back other notifications. Reclaiming an orphaned file is a separate,
         caller-driven step via ``get_orphaned_attachment_files``.
+
+        The notification it was attached to changes with it, so its version token moves.
         """
-        NotificationAttachmentModel.objects.filter(pk=str(attachment_id)).delete()
+        join_rows = NotificationAttachmentModel.objects.filter(pk=str(attachment_id))
+        with transaction.atomic():
+            notification_ids = list(join_rows.values_list("notification_id", flat=True))
+            join_rows.delete()
+            if notification_ids:
+                NotificationModel.objects.filter(id__in=notification_ids).update(
+                    notification_version=new_notification_version()
+                )
 
     # ------------------------------------------------------------------ persistence
 
@@ -401,7 +486,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         )
 
         if attachments:
-            self._store_attachments(attachments, notification_instance.pk)
+            self._store_attachments_and_move_version(attachments, notification_instance.pk)
 
         return self.serialize_user_notification(notification_instance)
 
@@ -444,7 +529,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         )
 
         if attachments:
-            self._store_attachments(attachments, notification_instance.pk)
+            self._store_attachments_and_move_version(attachments, notification_instance.pk)
 
         return self.serialize_one_off_notification(notification_instance)
 
@@ -461,19 +546,23 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         pending = NotificationModel.objects.filter(
             id=str(notification_id), status__in=REPINNABLE_NOTIFICATION_STATUSES
         )
-        if values:
-            records_updated = pending.update(**values)
-            if records_updated == 0:
-                raise NotificationUpdateError(
-                    "Failed to update notification, it may have already been sent"
+        if values or attachments:
+            # Linking attachments changes the notification too, so it moves the version token
+            # as well. One transaction, so a link that fails leaves the token where it was.
+            with transaction.atomic():
+                records_updated = pending.update(
+                    **values, notification_version=new_notification_version()
                 )
+                if records_updated == 0:
+                    raise NotificationUpdateError(
+                        "Failed to update notification, it may have already been sent"
+                    )
+                if attachments:
+                    self._attach_stored_attachments(notification_id, attachments)
         elif not pending.exists():
             raise NotificationUpdateError(
                 "Failed to update notification, it may have already been sent"
             )
-
-        if attachments:
-            self._attach_stored_attachments(notification_id, attachments)
 
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
 
@@ -482,7 +571,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
-        ).update(status=NotificationStatus.SENT.value, sent_at=timezone.now())
+        ).update(
+            status=NotificationStatus.SENT.value,
+            sent_at=timezone.now(),
+            notification_version=new_notification_version(),
+        )
         if records_updated == 0:
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
@@ -492,7 +585,10 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
-        ).update(status=NotificationStatus.FAILED.value)
+        ).update(
+            status=NotificationStatus.FAILED.value,
+            notification_version=new_notification_version(),
+        )
         if records_updated == 0:
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
@@ -502,7 +598,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.SENT.value
-        ).update(status=NotificationStatus.READ.value, read_at=timezone.now())
+        ).update(
+            status=NotificationStatus.READ.value,
+            read_at=timezone.now(),
+            notification_version=new_notification_version(),
+        )
         if records_updated == 0:
             raise NotificationUpdateError("Failed to update notification status")
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
@@ -510,7 +610,10 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         records_updated = NotificationModel.objects.filter(
             id=str(notification_id), status=NotificationStatus.PENDING_SEND.value
-        ).update(status=NotificationStatus.CANCELLED.value)
+        ).update(
+            status=NotificationStatus.CANCELLED.value,
+            notification_version=new_notification_version(),
+        )
 
         if records_updated == 0:
             raise NotificationCancelError("Failed to delete notification")
@@ -519,30 +622,121 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         self,
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        """Put a FAILED or CANCELLED notification back into PENDING_SEND.
+        """Put a FAILED or CANCELLED notification back into PENDING_SEND, in one conditional UPDATE.
 
         The status check is part of the UPDATE's WHERE clause, so a notification another caller
         requeued first, or a worker sent in the meantime, is refused rather than overwritten.
+        ``template_version`` is pinned in the same UPDATE. ``expected_version`` (a token from
+        ``filter_notification_versions``) joins the WHERE clause too, so a notification written
+        since it was listed is refused with ``NotificationVersionChangedError``.
+
+        When the UPDATE matches nothing, the row's status and version are read once to say why:
+        ``NotificationNotFoundError``, ``NotificationVersionChangedError`` or
+        ``NotificationRequeueError``. Nothing is written in any of those cases.
         """
+        expected = _parse_expected_version(expected_version)
         values: dict[str, object] = {
             "status": NotificationStatus.PENDING_SEND.value,
             "sent_at": None,
             "modified": timezone.now(),
+            "notification_version": new_notification_version(),
         }
         if send_after is not UNSET:
             values["send_after"] = send_after
+        if template_version is not None:
+            values["requested_template_version"] = template_version
 
-        records_updated = NotificationModel.objects.filter(
-            id=str(notification_id), status__in=REQUEUEABLE_NOTIFICATION_STATUSES
-        ).update(**values)
+        conditions = Q(id=str(notification_id), status__in=REQUEUEABLE_NOTIFICATION_STATUSES)
+        if expected is not None:
+            conditions &= Q(notification_version=expected)
+        records_updated = NotificationModel.objects.filter(conditions).update(**values)
         if records_updated == 0:
-            if not NotificationModel.objects.filter(id=str(notification_id)).exists():
+            current = self._get_status_and_version(notification_id)
+            if current is None:
                 raise NotificationNotFoundError(f"Notification {notification_id} not found")
+            status, version = current
+            if expected is not None and version != expected:
+                raise _changed_error("requeue", notification_id)
+            if status in REQUEUEABLE_NOTIFICATION_STATUSES:
+                # Every condition of the UPDATE holds on this second look, so the row was
+                # written between the two statements (e.g. requeued and failed again): changed.
+                raise _changed_error("requeue", notification_id)
             raise NotificationRequeueError(
                 f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
             )
         return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+    ) -> Notification | OneOffNotification:
+        """Pin a notification to a template version, in one conditional UPDATE.
+
+        The WHERE clause carries the statuses a pin may still change in (PENDING_SEND, FAILED,
+        CANCELLED), ``expected_version`` when given, and "not already pinned to this version",
+        so a notification a worker sends in the meantime is never repinned. Only
+        ``requested_template_version`` changes, with ``modified`` and the version token.
+
+        When the UPDATE matches nothing, the row is read once to say why, and nothing is
+        written: ``NotificationNotFoundError``, ``NotificationVersionChangedError`` (written
+        since ``expected_version``), ``NotificationRepinError`` (already delivered), or the
+        notification as it is when it is already on ``template_version``. A row that matches
+        every condition on that second look changed between the two statements, which is
+        ``NotificationVersionChangedError`` too.
+        """
+        expected = _parse_expected_version(expected_version)
+        # ``requested_template_version != V`` is not true for a NULL, so an unpinned row is
+        # named on its own.
+        conditions = Q(id=str(notification_id), status__in=REPINNABLE_NOTIFICATION_STATUSES) & (
+            Q(requested_template_version__isnull=True)
+            | ~Q(requested_template_version=template_version)
+        )
+        if expected is not None:
+            conditions &= Q(notification_version=expected)
+        records_updated = NotificationModel.objects.filter(conditions).update(
+            requested_template_version=template_version,
+            modified=timezone.now(),
+            notification_version=new_notification_version(),
+        )
+        if records_updated == 0:
+            try:
+                current = NotificationModel.objects.get(id=str(notification_id))
+            except NotificationModel.DoesNotExist as e:
+                raise NotificationNotFoundError(f"Notification {notification_id} not found") from e
+            if expected is not None and current.notification_version != expected:
+                raise _changed_error("repin", notification_id)
+            if current.status not in REPINNABLE_NOTIFICATION_STATUSES:
+                raise NotificationRepinError(
+                    f"Cannot repin notification {notification_id}: it has already been delivered"
+                )
+            if current.requested_template_version == template_version:
+                return self.serialize_notification(current)
+            raise NotificationVersionChangedError(
+                f"Cannot repin notification {notification_id}: it changed while it was being "
+                "written"
+            )
+        return self.serialize_notification(NotificationModel.objects.get(id=str(notification_id)))
+
+    def _get_status_and_version(
+        self, notification_id: int | str | uuid.UUID
+    ) -> tuple[str, uuid.UUID | None] | None:
+        """The row's status and version token, reading no other column; ``None`` if missing.
+
+        The token is ``None`` on a row inserted by code predating the column, between
+        migrations 0009 and 0010.
+        """
+        return (
+            NotificationModel.objects.filter(id=str(notification_id))
+            .values_list("status", "notification_version")
+            .first()
+        )
 
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
@@ -681,8 +875,12 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             base = base.filter(user_id=str(user_id))
 
         with transaction.atomic():
+            # Every row this marks gets the same new token. Tokens are compared per row, with
+            # the id in the same WHERE clause, so sharing a value across rows is harmless.
             base.filter(status=NotificationStatus.SENT.value).update(
-                status=NotificationStatus.READ.value, read_at=timezone.now()
+                status=NotificationStatus.READ.value,
+                read_at=timezone.now(),
+                notification_version=new_notification_version(),
             )
 
         read_qs = base.filter(status=NotificationStatus.READ.value).order_by("-created", "-id")
@@ -731,7 +929,9 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         adapter_import_str: str,
     ) -> None:
         NotificationModel.objects.filter(id=str(notification_id)).update(
-            context_used=context, adapter_used=adapter_import_str
+            context_used=context,
+            adapter_used=adapter_import_str,
+            notification_version=new_notification_version(),
         )
 
     def store_git_commit_sha(
@@ -740,7 +940,7 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         git_commit_sha: str,
     ) -> None:
         NotificationModel.objects.filter(id=str(notification_id)).update(
-            git_commit_sha=git_commit_sha
+            git_commit_sha=git_commit_sha, notification_version=new_notification_version()
         )
 
     def store_template_version(
@@ -751,7 +951,8 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
         # Overridden rather than inherited: the seam's default is a no-op so a backend with
         # nowhere to put this keeps working, and there is a column for it here.
         NotificationModel.objects.filter(id=str(notification_id)).update(
-            used_template_version=template_version
+            used_template_version=template_version,
+            notification_version=new_notification_version(),
         )
 
     # ------------------------------------------------------------------ filtering
@@ -833,7 +1034,45 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
     def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
         return NotificationModel.objects.filter(self._translate_filter(filter)).count()
 
+    def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        """The ID and version token of every notification matching ``filter``, ordered by ID.
+
+        Selects the ``id`` and ``notification_version`` columns and nothing else, with no
+        ``select_related`` or ``prefetch_related``, so no recipient, context, context parameters,
+        rendered content or attachment is read. Pages are 1-indexed, like the rest of this
+        backend. ``version`` is the token as a string; pass it as ``expected_version`` to
+        ``requeue_notification`` or ``repin_notification`` to act on the notification only
+        while it is unchanged.
+        """
+        offset = (page - 1) * page_size
+        rows = (
+            NotificationModel.objects.filter(self._translate_filter(filter))
+            .order_by("id")
+            .values_list("id", "notification_version")[offset : offset + page_size]
+        )
+        # A row inserted by code predating the column, between migrations 0009 and 0010, has no
+        # token yet. It is still listed (hiding it would hide a notification), with the empty
+        # string as its version rather than ``str(None)``. That is not a token this backend
+        # hands out, and a NULL never equals any token, so a conditional requeue or repin against
+        # such a row, with any ``expected_version``, is refused as changed. Listing does not
+        # write a token: a read that writes would move the version it is reporting.
+        return [
+            NotificationVersion(id=pk, version="" if token is None else str(token))
+            for pk, token in rows
+        ]
+
     def get_filter_capabilities(self) -> dict[str, bool]:
-        # This backend translates the full vocabulary into SQL, so it declines nothing: an empty
-        # report means every capability is supported once merged over the all-True default.
-        return {}
+        # This backend translates the full vocabulary into SQL. Every key but the presence
+        # filters is supported by default, so those are the only ones it has to report.
+        return dict(PRESENCE_FILTER_CAPABILITIES)
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        # Requeue and repin are single conditional UPDATEs that check expected_version against
+        # notification_version, requeue pins in the same UPDATE, and filter_notification_versions
+        # selects the id and the token only.
+        return dict(ACTION_CAPABILITIES)
