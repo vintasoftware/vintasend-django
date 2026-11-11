@@ -7,11 +7,16 @@ from django.test import override_settings
 from django.utils import timezone
 
 import pytest
-from vintasend.constants import NotificationStatus, NotificationTypes
+from vintasend.constants import (
+    REQUEUEABLE_NOTIFICATION_STATUSES,
+    NotificationStatus,
+    NotificationTypes,
+)
 from vintasend.exceptions import (
     AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
+    NotificationRequeueError,
     NotificationUpdateError,
 )
 from vintasend.services.dataclasses import (
@@ -107,7 +112,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
 
         updated_notification = DjangoDbNotificationBackend().persist_notification_update(
             notification_id=notification.id,
-            updated_data={"subject_template": "updated test subject"},
+            update_data={"subject_template": "updated test subject"},
         )
 
         assert updated_notification.subject_template == "updated test subject"
@@ -217,7 +222,7 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
         )
         DjangoDbNotificationBackend().persist_notification_update(
             notification_id=already_sent.id,
-            updated_data={"status": NotificationStatus.SENT.value},
+            update_data={"status": NotificationStatus.SENT.value},
         )
 
         notifications = list(
@@ -552,8 +557,10 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
             preheader_template="test",
         )
         DjangoDbNotificationBackend().cancel_notification(notification.id)
-        with pytest.raises(NotificationNotFoundError):
-            DjangoDbNotificationBackend().get_notification(notification.id)
+
+        # Kept and returned as CANCELLED, so it can be requeued.
+        cancelled = DjangoDbNotificationBackend().get_notification(notification.id)
+        assert cancelled.status == NotificationStatus.CANCELLED.value
 
     def test_persist_one_off_notification(self):
         """Test creating one-off notification"""
@@ -1554,3 +1561,188 @@ class DjangoDBNotificationBackendTestCase(VintaSendDjangoTestCase):
             assert stream.read() == b"stream me"
         assert stored.file.url()
         stored.file.delete()
+
+
+class DjangoDbRequeueNotificationTestCase(VintaSendDjangoTestCase):
+    """``requeue_notification`` on the Django backend, and the service actions built on it."""
+
+    def setUp(self):
+        super().setUp()
+        self._media_root = tempfile.mkdtemp()
+        self._media_override = override_settings(MEDIA_ROOT=self._media_root)
+        self._media_override.enable()
+        self.backend = DjangoDbNotificationBackend()
+
+    def tearDown(self):
+        self._media_override.disable()
+        shutil.rmtree(self._media_root, ignore_errors=True)
+        super().tearDown()
+
+    def _make(self, status: NotificationStatus, **kwargs) -> Notification:
+        notification = self.backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Requeue",
+            body_template="test",
+            context_name=kwargs.pop("context_name", "test"),
+            context_kwargs={},
+            send_after=kwargs.pop("send_after", timezone.now() + timedelta(days=1)),
+            **kwargs,
+        )
+        NotificationModel.objects.filter(id=notification.id).update(status=status.value)
+        return notification
+
+    def test_moves_only_a_failed_or_cancelled_notification(self):
+        for status in NotificationStatus:
+            with self.subTest(status=status):
+                notification = self._make(status)
+                if status.value in REQUEUEABLE_NOTIFICATION_STATUSES:
+                    requeued = self.backend.requeue_notification(notification.id)
+                    assert requeued.status == NotificationStatus.PENDING_SEND.value
+                    continue
+                with pytest.raises(NotificationRequeueError) as raised:
+                    self.backend.requeue_notification(notification.id)
+                assert str(raised.value) == (
+                    f"Cannot requeue notification {notification.id}: it is not FAILED or CANCELLED"
+                )
+                record = NotificationModel.objects.get(id=notification.id)
+                assert record.status == status.value
+
+    def test_the_status_check_is_part_of_the_write(self):
+        notification = self._make(NotificationStatus.FAILED)
+
+        self.backend.requeue_notification(notification.id)
+
+        # A second caller racing the first finds it PENDING_SEND and is refused.
+        with pytest.raises(NotificationRequeueError):
+            self.backend.requeue_notification(notification.id)
+
+    def test_an_unknown_id_is_not_found(self):
+        missing = random.randint(100000, 200000)
+
+        with pytest.raises(NotificationNotFoundError) as raised:
+            self.backend.requeue_notification(missing)
+
+        assert str(raised.value) == f"Notification {missing} not found"
+
+    def test_send_after_is_applied_only_when_passed(self):
+        original = timezone.now() + timedelta(days=2)
+        later = timezone.now() + timedelta(days=5)
+        notification = self._make(NotificationStatus.FAILED, send_after=original)
+
+        assert self.backend.requeue_notification(notification.id).send_after == original
+        self.backend.mark_pending_as_failed(notification.id)
+        assert self.backend.requeue_notification(notification.id, later).send_after == later
+        self.backend.mark_pending_as_failed(notification.id)
+        assert self.backend.requeue_notification(notification.id, None).send_after is None
+        assert NotificationModel.objects.get(id=notification.id).send_after is None
+
+    def test_clears_sent_at_and_keeps_the_rest(self):
+        notification = self._make(NotificationStatus.FAILED, requested_template_version=3)
+        NotificationModel.objects.filter(id=notification.id).update(
+            sent_at=timezone.now(), context_used={"stored": True}, adapter_used="some.adapter"
+        )
+
+        requeued = self.backend.requeue_notification(notification.id)
+
+        assert requeued.sent_at is None
+        assert requeued.requested_template_version == 3
+        assert requeued.context_used == {"stored": True}
+        assert requeued.adapter_used == "some.adapter"
+
+    def test_returns_the_attachments(self):
+        notification = self.backend.persist_notification(
+            user_id=self.user.pk,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="With attachment",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            attachments=[NotificationAttachment(file=b"report", filename="report.txt")],
+        )
+        NotificationModel.objects.filter(id=notification.id).update(
+            status=NotificationStatus.CANCELLED.value
+        )
+
+        requeued = self.backend.requeue_notification(notification.id)
+
+        assert [attachment.filename for attachment in requeued.attachments] == ["report.txt"]
+
+    def test_requeues_a_one_off_notification(self):
+        notification = self.backend.persist_one_off_notification(
+            email_or_phone="someone@example.com",
+            first_name="Some",
+            last_name="One",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="One-off",
+            body_template="test",
+            context_name="test",
+            context_kwargs={},
+            send_after=None,
+            subject_template="",
+            preheader_template="",
+        )
+        NotificationModel.objects.filter(id=notification.id).update(
+            status=NotificationStatus.FAILED.value
+        )
+
+        requeued = self.backend.requeue_notification(notification.id)
+
+        assert isinstance(requeued, OneOffNotification)
+        assert requeued.status == NotificationStatus.PENDING_SEND.value
+
+    def test_a_failed_or_cancelled_notification_can_be_updated(self):
+        for status in (NotificationStatus.FAILED, NotificationStatus.CANCELLED):
+            with self.subTest(status=status):
+                notification = self._make(status)
+
+                updated = self.backend.persist_notification_update(
+                    notification.id, {"requested_template_version": 4}
+                )
+
+                assert updated.requested_template_version == 4
+                assert updated.status == status.value
+
+    def test_the_service_requeues_a_cancelled_notification_and_sends_it(self):
+        from vintasend.services.notification_service import NotificationService, register_context
+
+        register_context("django_requeue_test_context")(lambda: {"greeting": "hi"})
+        service = NotificationService(
+            notification_adapters=[(FAKE_EMAIL_ADAPTER, FAKE_RENDERER)],
+            notification_backend=self.backend,
+        )
+        notification = self._make(
+            NotificationStatus.PENDING_SEND, context_name="django_requeue_test_context"
+        )
+        service.cancel_notification(notification.id)
+
+        requeued = service.requeue_notification(notification.id, send_after=None)
+
+        assert requeued.status == NotificationStatus.PENDING_SEND.value
+        assert NotificationModel.objects.get(id=notification.id).status == (
+            NotificationStatus.SENT.value
+        )
+
+    def test_the_service_repins_a_failed_notification(self):
+        from vintasend.services.notification_service import NotificationService
+
+        service = NotificationService(
+            notification_adapters=[(FAKE_EMAIL_ADAPTER, FAKE_RENDERER)],
+            notification_backend=self.backend,
+        )
+        notification = self._make(NotificationStatus.FAILED)
+
+        repinned = service.repin_notification(notification.id, template_version=0)
+
+        assert repinned.requested_template_version == 0
+        record = NotificationModel.objects.get(id=notification.id)
+        assert record.requested_template_version == 0
+        assert record.status == NotificationStatus.FAILED.value
+
+
+FAKE_EMAIL_ADAPTER = "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter"
+FAKE_RENDERER = (
+    "vintasend.services.notification_template_renderers.stubs."
+    "fake_templated_email_renderer.FakeTemplateRenderer"
+)
