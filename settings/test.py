@@ -14,7 +14,13 @@ DATABASES = {
     "default": {
         "NAME": "db.sqlite3",
         "ENGINE": "django.db.backends.sqlite3",
-    }
+    },
+    # A second database for the replication tests: a DjangoDbNotificationBackend with
+    # database="replica" as an additional backend. The test runner migrates it too.
+    "replica": {
+        "NAME": "replica.sqlite3",
+        "ENGINE": "django.db.backends.sqlite3",
+    },
 }
 
 

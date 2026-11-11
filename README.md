@@ -9,6 +9,33 @@ the `count_in_app_notifications` / `count_in_app_unread_notifications` counters,
 idempotent, optionally user-scoped `mark_sent_as_read_bulk`. See the `vintasend` README for the
 service-level in-app API (pagination, counts and bulk mark-as-read).
 
+## Backend options
+
+`DjangoDbNotificationBackend` takes two keyword-only options:
+
+* `database` (default `"default"`): the Django database alias the backend runs on. Every query,
+  transaction and save it makes uses that alias, so two backends on two aliases never touch each
+  other's tables. `DjangoAttachmentManager` does not touch the database at all.
+* `backend_identifier` (default `None`): what `get_backend_identifier()` returns, the stable
+  name a multi-backend `NotificationService` addresses the backend by (`backend_identifier=` on
+  its methods, the replication queue). Leave it `None` and the service names it `backend-{n}` by
+  position, which shifts if backends are reordered.
+
+```python
+DjangoDbNotificationBackend(database="replica", backend_identifier="replica")
+
+# Or from an import string, as settings do:
+NotificationService(
+    notification_backend="vintasend_django.services.notification_backends."
+    "django_db_notification_backend.DjangoDbNotificationBackend",
+    notification_backend_kwargs={"database": "replica", "backend_identifier": "replica"},
+)
+```
+
+Both are kept in `backend_kwargs` when they are not the defaults, so a backend rebuilt from them,
+such as the one a `vintasend-celery` worker builds, runs on the same alias. The alias must be
+migrated like any other: `python manage.py migrate --database=replica`.
+
 ## Requeueing and repinning
 
 `DjangoDbNotificationBackend` implements `requeue_notification` and `repin_notification` as single
@@ -39,8 +66,9 @@ notification as well as a pending one; a `SENT` or `READ` one still raises
 ## Moving notifications safely
 
 The backend implements every optional action vintasend offers for moving notifications, and
-reports all four in `get_action_capabilities()` (`repin.expectedVersion`,
-`requeue.expectedVersion`, `requeue.templateVersion`, `versions.filter`). It also evaluates the
+reports all five in `get_action_capabilities()` (`repin.expectedVersion`,
+`requeue.expectedVersion`, `requeue.templateVersion`, `versions.filter`,
+`writes.notificationVersion`; see [Replicas](#replicas) for the last). It also evaluates the
 presence filters `has_send_after` and `has_requested_template_version` (`IS NOT NULL` / `IS NULL`,
 negation included) and reports them in `get_filter_capabilities()`.
 
@@ -86,6 +114,67 @@ and `save(update_fields=...)` included. Two kinds of write do not, and must set 
 
 `bulk_update()` skips `save()` too, so include `notification_version` in its fields with a new
 value per object.
+
+### Replicas
+
+With a second `DjangoDbNotificationBackend` as an additional backend, on its own database, the
+replica holds the **primary's** tokens, so versions listed from it are ones the primary accepts:
+
+```python
+# settings.DATABASES has "default" and "replica", both migrated.
+service = NotificationService(
+    notification_backend=DjangoDbNotificationBackend(backend_identifier="primary"),
+    additional_backends=[
+        DjangoDbNotificationBackend(database="replica", backend_identifier="replica")
+    ],
+    replication_mode="inline",
+)
+
+for listed in service.filter_notification_versions(failed, 1, 100, backend_identifier="replica"):
+    service.requeue_notification(listed.id, expected_version=listed.version, send=False)
+```
+
+`get_backend_supported_action_capabilities("replica")` reports `versions.filter` for it.
+
+* **Snapshot apply carries the token.** After every replicated write, requeue and repin
+  included, the service hands the replica the primary's post-write snapshot.
+  `apply_replication_snapshot_if_newer` upserts it by id in one transaction: it inserts the row
+  with the primary's id, `created`, `modified` and token, or overwrites an existing row with one
+  conditional `UPDATE` whose `WHERE` carries `modified <= snapshot.modified`, so a row newer than
+  the snapshot is left alone and the snapshot is declined as `superseded`, so the service does
+  not replay the older write over it. Every other write the backend makes sets `modified` to
+  now, so of two snapshots applied out of order the later one wins. A snapshot with no token, or
+  one that is not a UUID, gets a fresh one. It is also declined, with nothing written, when the
+  id does not fit this database's primary key (its range read from this database) or the
+  notification's user does not exist in this database.
+* **Replayed rows are stamped.** When the replica declines a snapshot for any other reason, the
+  service replays the write with the replica's own methods, with no token, so each replayed
+  write mints the replica's own. It then re-reads the row and, only if it matches the primary's
+  snapshot, writes the primary's token with
+  `persist_notification_update(id, {}, notification_version=<token>)`. The backend accepts that
+  token-only write in any status, `SENT` and `READ` included, and changes nothing else, not even
+  `modified`; a content update of a delivered notification is still refused. If any step fails
+  the replica keeps a token of its own, which the primary refuses.
+* **Promoting a replica.** Rows the replica receives keep the primary's ids, and an explicit-id
+  insert does not advance the id sequence on PostgreSQL or Oracle. The snapshot apply resets the
+  sequence after each insert, but a sequence reset is not transactional, so two concurrent
+  inserts can leave it behind the highest id. Before making a replica the primary (after
+  `migrate_to_backend`, say), with replication stopped, run
+  `reset_notification_id_sequence("<alias>")` from
+  `vintasend_django.services.notification_backends.django_db_notification_backend`, or
+  `python manage.py sqlsequencereset vintasend_django --database=<alias>` and run its output
+  with `python manage.py dbshell --database=<alias>`. SQLite and MySQL need neither.
+* **Lag means `CHANGED`.** With queued replication, or a replica that missed a write, the replica
+  can list a token the primary has moved past. The primary refuses it with reason `CHANGED` and
+  nothing is written on either side: list again and retry.
+* **Attachments share storage.** A snapshot's attachments are linked on the replica by matching
+  its file records on `(checksum, size)`, or by creating a record from the snapshot's file
+  metadata and `storage_identifiers`; join rows are then added and removed to match. No byte is
+  read or copied, so this assumes both backends' attachment managers read the **same** storage
+  (the same Django storage, bucket or `MEDIA_ROOT`). A replica whose manager reads other storage
+  holds attachments it cannot open.
+* **Users must exist on both.** The notification's user is a foreign key, so the replica's user
+  table must hold the same users, with the same primary keys.
 
 ### Migration
 

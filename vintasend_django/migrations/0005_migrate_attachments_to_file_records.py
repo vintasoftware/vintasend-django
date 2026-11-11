@@ -41,6 +41,9 @@ def forwards(apps, schema_editor):
     file_record_model = apps.get_model("vintasend_django", "AttachmentFileRecord")
     join_model = apps.get_model("vintasend_django", "NotificationAttachment")
     can_return_pks = schema_editor.connection.features.can_return_rows_from_bulk_insert
+    # Every query on the database being migrated, not "default": a project with several
+    # databases migrates each of them with this.
+    alias = schema_editor.connection.alias
 
     def flush(attachments):
         records = [
@@ -57,12 +60,12 @@ def forwards(apps, schema_editor):
             for attachment in attachments
         ]
         if can_return_pks:
-            file_record_model.objects.bulk_create(records, batch_size=BATCH_SIZE)
+            file_record_model.objects.using(alias).bulk_create(records, batch_size=BATCH_SIZE)
         else:
             # This backend does not return PKs from a bulk insert, so persist records one by one
             # to obtain the PKs the join-row FK needs. The join rows still go in one bulk insert.
             for record in records:
-                record.save()
+                record.save(using=alias)
 
         join_rows = [
             join_model(
@@ -74,10 +77,10 @@ def forwards(apps, schema_editor):
             )
             for attachment, record in zip(attachments, records, strict=True)
         ]
-        join_model.objects.bulk_create(join_rows, batch_size=BATCH_SIZE)
+        join_model.objects.using(alias).bulk_create(join_rows, batch_size=BATCH_SIZE)
 
     batch = []
-    for attachment in attachment_model.objects.all().iterator(chunk_size=BATCH_SIZE):
+    for attachment in attachment_model.objects.using(alias).iterator(chunk_size=BATCH_SIZE):
         batch.append(attachment)
         if len(batch) >= BATCH_SIZE:
             flush(batch)
@@ -97,9 +100,10 @@ def backwards(apps, schema_editor):
     """
     Attachment = apps.get_model("vintasend_django", "Attachment")
     NotificationAttachment = apps.get_model("vintasend_django", "NotificationAttachment")
+    alias = schema_editor.connection.alias
 
     restored = []
-    for join_row in NotificationAttachment.objects.select_related("file").iterator(
+    for join_row in NotificationAttachment.objects.using(alias).select_related("file").iterator(
         chunk_size=BATCH_SIZE
     ):
         record = join_row.file
@@ -117,10 +121,10 @@ def backwards(apps, schema_editor):
             attachment.file.name = stored_name
         restored.append(attachment)
         if len(restored) >= BATCH_SIZE:
-            Attachment.objects.bulk_create(restored, batch_size=BATCH_SIZE)
+            Attachment.objects.using(alias).bulk_create(restored, batch_size=BATCH_SIZE)
             restored = []
     if restored:
-        Attachment.objects.bulk_create(restored, batch_size=BATCH_SIZE)
+        Attachment.objects.using(alias).bulk_create(restored, batch_size=BATCH_SIZE)
 
 
 class Migration(migrations.Migration):

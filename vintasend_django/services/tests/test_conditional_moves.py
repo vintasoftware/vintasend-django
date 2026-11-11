@@ -741,6 +741,7 @@ class PresenceFiltersTestCase(ConditionalMovesTestCase):
             "requeue.expectedVersion": True,
             "requeue.templateVersion": True,
             "versions.filter": True,
+            "writes.notificationVersion": True,
         }
 
 
@@ -758,6 +759,7 @@ class ServiceTestCase(ConditionalMovesTestCase):
             "requeue.expectedVersion": True,
             "requeue.templateVersion": True,
             "versions.filter": True,
+            "writes.notificationVersion": True,
         }
         filter_capabilities = self.service.get_backend_supported_filter_capabilities()
         assert filter_capabilities["fields.hasSendAfter"] is True

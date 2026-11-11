@@ -10,7 +10,8 @@ through the configured attachment manager, computes its sha256 and real size, an
 it whenever suits the deployment -- off-peak, in a worker, over several sessions -- rather than
 paying the file-read cost during a deploy migration. It is safe to re-run and safe to interrupt:
 each record is updated on its own, and only records still missing a checksum are touched unless
-``--all`` is given.
+``--all`` is given. ``--database`` names the alias whose records it backfills (``default``
+unless given), e.g. a replica's when a ``DjangoDbNotificationBackend`` runs on one.
 """
 
 import hashlib
@@ -53,6 +54,11 @@ class Command(BaseCommand):
             default=None,
             help="Process at most this many records this run (for chunking a large backfill).",
         )
+        parser.add_argument(
+            "--database",
+            default="default",
+            help="The database alias whose records to backfill (default: default).",
+        )
 
     def _resolve_manager(self):
         # Read files through the manager the app actually configured (it wrote the
@@ -67,10 +73,11 @@ class Command(BaseCommand):
         recompute_all = options["all"]
         dry_run = options["dry_run"]
         limit = options["limit"]
+        database = options["database"]
 
         manager = self._resolve_manager()
 
-        queryset = AttachmentFileRecord.objects.all().order_by("pk")
+        queryset = AttachmentFileRecord.objects.using(database).order_by("pk")
         if not recompute_all:
             queryset = queryset.filter(Q(checksum="") | Q(checksum__isnull=True))
 
@@ -90,9 +97,8 @@ class Command(BaseCommand):
             identifiers = record.storage_identifiers or {}
             if not (identifiers.get("name") or identifiers.get("id")):
                 skipped += 1
-                self.stderr.write(
-                    f"  record {record.pk} ({record.filename}): no storage identifiers, skipped"
-                )
+                # The id only: a filename, like a storage error's text, can name the patient.
+                self.stderr.write(f"  record {record.pk}: no storage identifiers, skipped")
                 continue
 
             try:
@@ -100,7 +106,7 @@ class Command(BaseCommand):
             except Exception as error:  # noqa: BLE001 - one bad file must not abort the backfill
                 skipped += 1
                 self.stderr.write(
-                    f"  record {record.pk} ({record.filename}): could not read file ({error}), skipped"
+                    f"  record {record.pk}: could not read file ({type(error).__name__}), skipped"
                 )
                 continue
 
@@ -115,7 +121,9 @@ class Command(BaseCommand):
 
             # Bypass the model's save() so AutoLastModifiedField does not churn ``modified`` on a
             # pure metadata backfill; only checksum and size change.
-            AttachmentFileRecord.objects.filter(pk=record.pk).update(checksum=checksum, size=size)
+            AttachmentFileRecord.objects.using(database).filter(pk=record.pk).update(
+                checksum=checksum, size=size
+            )
             updated += 1
 
         verb = "Would update" if dry_run else "Updated"
