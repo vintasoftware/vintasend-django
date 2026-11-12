@@ -1,14 +1,26 @@
+import uuid
+
 from django.contrib.auth import get_user_model
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from model_utils.fields import AutoCreatedField, AutoLastModifiedField
+from vintasend.utils.uuid_utils import uuid7
 
 from vintasend_django.constants import NotificationStatusChoices, NotificationTypesChoices
 
 
 User = get_user_model()
+
+
+def new_notification_version() -> uuid.UUID:
+    """A fresh version token for a notification row: a UUIDv7.
+
+    A module-level function rather than ``uuid7`` itself so the migrations reference a callable
+    this package owns.
+    """
+    return uuid7()
 
 
 class Notification(models.Model):
@@ -71,6 +83,16 @@ class Notification(models.Model):
     created = AutoCreatedField(_("created"), db_index=True)
     modified = AutoLastModifiedField(_("modified"), db_index=True)
 
+    # The version token ``filter_notification_versions`` hands out and ``requeue_notification`` /
+    # ``repin_notification`` check as ``expected_version``. A fresh UUIDv7 on EVERY write to the
+    # row: the backend sets it in each ``QuerySet.update()`` it runs (``update()`` skips field
+    # defaults and ``save()``), and ``save()`` below sets it for every other ORM save, the admin
+    # included. A write that goes around both, such as raw SQL or a host app's own
+    # ``QuerySet.update()``, must set it too, or ``expected_version`` cannot see that write.
+    notification_version = models.UUIDField(
+        _("notification version"), default=new_notification_version, editable=False
+    )
+
     adapter_extra_parameters = models.JSONField(
         _("extra parameters for the notification adapter"), null=True, encoder=DjangoJSONEncoder
     )
@@ -89,6 +111,21 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"{self.user} - {self.notification_type} - {self.title} - {self.status}{f' (scheduled to {self.send_after})' if self.send_after else ''}"
+
+    def save(self, *args, **kwargs):
+        # A new version token on every save that writes the row. ``update_fields`` limits what is
+        # written, so the token is added to it. An empty ``update_fields`` writes nothing, so it
+        # is left alone.
+        update_fields = kwargs.get("update_fields")
+        if update_fields is None:
+            self.notification_version = new_notification_version()
+        else:
+            update_fields = set(update_fields)
+            if update_fields:
+                self.notification_version = new_notification_version()
+                update_fields.add("notification_version")
+            kwargs["update_fields"] = update_fields
+        super().save(*args, **kwargs)
 
 
 class AttachmentFileRecord(models.Model):

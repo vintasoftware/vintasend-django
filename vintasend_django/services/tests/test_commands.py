@@ -1,9 +1,12 @@
 import hashlib
+import io
 import shutil
 import tempfile
 
 from django.core.management import call_command
+from django.db import connections
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 
 from vintasend_django.models import AttachmentFileRecord
 from vintasend_django.services.attachment_managers.django_storage import DjangoAttachmentManager
@@ -11,6 +14,8 @@ from vintasend_django.test_helpers import VintaSendDjangoTestCase
 
 
 class BackfillAttachmentChecksumsCommandTest(VintaSendDjangoTestCase):
+    databases = {"default", "replica"}  # noqa: RUF012 - Django's own class attribute
+
     def setUp(self):
         super().setUp()
         self._media_root = tempfile.mkdtemp()
@@ -87,11 +92,15 @@ class BackfillAttachmentChecksumsCommandTest(VintaSendDjangoTestCase):
                 "name": "notifications/attachments/missing.txt",
             },
         )
+        stderr = io.StringIO()
 
-        call_command("backfill_attachment_checksums")
+        call_command("backfill_attachment_checksums", stderr=stderr)
 
         record.refresh_from_db()
         assert record.checksum == ""
+        # Names the record by id only: a filename or a storage error's text can carry PHI.
+        assert f"record {record.pk}:" in stderr.getvalue()
+        assert "missing" not in stderr.getvalue()
 
     def test_limit_processes_at_most_n_records(self):
         first = self._record_without_checksum(b"one", "one.txt")
@@ -113,8 +122,48 @@ class BackfillAttachmentChecksumsCommandTest(VintaSendDjangoTestCase):
             checksum="",
             storage_identifiers={},
         )
+        stderr = io.StringIO()
 
-        call_command("backfill_attachment_checksums")
+        call_command("backfill_attachment_checksums", stderr=stderr)
 
         record.refresh_from_db()
         assert record.checksum == ""
+        assert f"record {record.pk}:" in stderr.getvalue()
+        assert "orphan" not in stderr.getvalue()
+
+    def test_database_option_backfills_that_alias_only(self):
+        data = b"on the replica"
+        file_record = self.manager.upload_file(data, "r.txt", "text/plain")
+        records = {
+            alias: AttachmentFileRecord.objects.using(alias).create(
+                filename="r.txt",
+                content_type="text/plain",
+                size=file_record.size,
+                checksum="",
+                storage_identifiers=file_record.storage_identifiers,
+            )
+            for alias in ("default", "replica")
+        }
+
+        with CaptureQueriesContext(connections["default"]) as on_default:
+            call_command("backfill_attachment_checksums", "--database", "replica")
+
+        assert len(on_default.captured_queries) == 0
+        replica_record = AttachmentFileRecord.objects.using("replica").get(pk=records["replica"].pk)
+        assert replica_record.checksum == hashlib.sha256(data).hexdigest()
+        default_record = AttachmentFileRecord.objects.using("default").get(pk=records["default"].pk)
+        assert default_record.checksum == ""
+
+    def test_database_option_dry_run_writes_nothing(self):
+        file_record = self.manager.upload_file(b"dry", "d.txt", "text/plain")
+        record = AttachmentFileRecord.objects.using("replica").create(
+            filename="d.txt",
+            content_type="text/plain",
+            size=file_record.size,
+            checksum="",
+            storage_identifiers=file_record.storage_identifiers,
+        )
+
+        call_command("backfill_attachment_checksums", "--database", "replica", "--dry-run")
+
+        assert AttachmentFileRecord.objects.using("replica").get(pk=record.pk).checksum == ""

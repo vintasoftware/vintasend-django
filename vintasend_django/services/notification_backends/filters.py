@@ -58,6 +58,11 @@ STRING_LOOKUP_FIELDS: dict[str, str] = {
     "subject_template": "subject_template",
     "context_name": "context_name",
 }
+# Presence fields: ``True`` matches a row whose column is set, ``False`` one where it is NULL.
+PRESENCE_FIELDS: dict[str, str] = {
+    "has_send_after": "send_after",
+    "has_requested_template_version": "requested_template_version",
+}
 RANGE_FIELDS: dict[str, str] = {
     "send_after_range": "send_after",
     "created_at_range": "created",
@@ -160,6 +165,18 @@ def membership_q(model_field: str, spec: object) -> Q | None:
     return Q(**{f"{model_field}__in": [str(candidate) for candidate in candidates]})
 
 
+def presence_q(model_field: str, spec: object) -> Q | None:
+    """``Q`` for a presence field, or ``None`` if ``spec`` is not a ``bool``.
+
+    ``True`` is ``IS NOT NULL`` and ``False`` is ``IS NULL``. Neither can be NULL itself, so
+    ``NOT`` of either is exactly the other, and Django emits it as ``NOT (col IS [NOT] NULL)``
+    with no extra NULL guard.
+    """
+    if not isinstance(spec, bool):
+        return None
+    return Q(**{f"{model_field}__isnull": not spec})
+
+
 def _leaf(query: Q | None, model_field: str) -> tuple[Q, str | None]:
     if query is None:
         # A value that does not fit its field matches no row, and negating it must therefore
@@ -190,6 +207,12 @@ def field_leaf(field: str, value: object) -> tuple[Q, str | None]:
     if field in MEMBERSHIP_FIELDS:
         model_field = MEMBERSHIP_FIELDS[field]
         return _leaf(membership_q(model_field, value), model_field)
+    if field in PRESENCE_FIELDS:
+        # No null field to widen the negation with: a presence filter already says what it
+        # wants of NULL rows, and ORing ``IS NULL`` into ``NOT (has_* = False)`` would match
+        # every row.
+        query = presence_q(PRESENCE_FIELDS[field], value)
+        return (MATCH_NOTHING if query is None else query), None
     return MATCH_NOTHING, None
 
 

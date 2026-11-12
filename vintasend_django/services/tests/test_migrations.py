@@ -1,12 +1,17 @@
 import hashlib
+import importlib
+import re
 import shutil
 import tempfile
+import uuid
+from unittest import mock
 
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 
 
 MIGRATE_FROM = (
@@ -170,3 +175,180 @@ class AttachmentDataMigrationTest(TransactionTestCase):
         assert restored.mime_type == "text/plain"
         assert restored.file.name == name
         assert restored.file.read() == b"reverse bytes"
+
+
+BEFORE_VERSION = ("vintasend_django", "0007_notification_requested_template_version_and_more")
+VERSION_ADDED = ("vintasend_django", "0008_notification_notification_version")
+VERSION_BACKFILLED = ("vintasend_django", "0009_backfill_notification_version")
+VERSION_REQUIRED = ("vintasend_django", "0010_alter_notification_notification_version")
+BACKFILL_MODULE = "vintasend_django.migrations._notification_version_backfill"
+
+
+class NotificationVersionMigrationTest(TransactionTestCase):
+    """0008-0010 add ``notification_version`` and give every existing row its own token.
+
+    ``AddField`` with a callable default would give every existing row the same value, which
+    would let ``expected_version`` match a row it was not read from.
+    """
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+
+    @staticmethod
+    def _migrate(target):
+        executor = MigrationExecutor(connection)
+        executor.migrate([target])
+        return executor.loader.project_state([target]).apps
+
+    @staticmethod
+    def _create(apps, count, **kwargs):
+        notification_model = apps.get_model("vintasend_django", "Notification")
+        for i in range(count):
+            notification_model.objects.create(
+                notification_type="EMAIL",
+                title=f"n{i}",
+                body_template="body",
+                context_kwargs={},
+                **kwargs,
+            )
+        return notification_model
+
+    @staticmethod
+    def _columns():
+        with connection.cursor() as cursor:
+            return {
+                column.name: column
+                for column in connection.introspection.get_table_description(
+                    cursor, "vintasend_django_notification"
+                )
+            }
+
+    def test_0008_adds_a_nullable_column_and_writes_no_token(self):
+        self._create(self._migrate(BEFORE_VERSION), 3)
+
+        apps = self._migrate(VERSION_ADDED)
+
+        notification_model = apps.get_model("vintasend_django", "Notification")
+        assert self._columns()["notification_version"].null_ok
+        assert set(notification_model.objects.values_list("notification_version", flat=True)) == {
+            None
+        }
+
+    def test_existing_rows_each_get_their_own_uuid7(self):
+        self._create(self._migrate(BEFORE_VERSION), 5)
+
+        apps = self._migrate(VERSION_BACKFILLED)
+
+        notification_model = apps.get_model("vintasend_django", "Notification")
+        tokens = list(notification_model.objects.values_list("notification_version", flat=True))
+        assert len(tokens) == 5
+        assert len(set(tokens)) == 5
+        assert all(token is not None and token.version == 7 for token in tokens)
+        # 0009 leaves the column nullable, so code predating it can keep inserting rows.
+        assert self._columns()["notification_version"].null_ok
+
+    def test_the_backfill_commits_per_batch_and_reads_primary_keys_only(self):
+        backfill = importlib.import_module(BACKFILL_MODULE)
+        apps = self._migrate(VERSION_ADDED)
+        notification_model = self._create(apps, 5)
+
+        with (
+            mock.patch.object(backfill, "BATCH_SIZE", 2),
+            mock.patch.object(
+                backfill.transaction, "atomic", wraps=backfill.transaction.atomic
+            ) as atomic,
+            CaptureQueriesContext(connection) as queries,
+        ):
+            backfill.backfill_notification_versions(apps, connection.schema_editor())
+
+        # 3 batches of at most 2, then an empty read: one transaction each, one bulk UPDATE per
+        # non-empty batch.
+        assert atomic.call_count == 4
+        selects = [q["sql"] for q in queries.captured_queries if q["sql"].startswith("SELECT")]
+        updates = [q["sql"] for q in queries.captured_queries if q["sql"].startswith("UPDATE")]
+        assert len(selects) == 4
+        assert len(updates) == 3
+        for sql in selects:
+            select_list = sql[len("SELECT ") : sql.index(" FROM ")]
+            assert re.findall(r'"vintasend_django_notification"\."(\w+)"', select_list) == ["id"]
+        tokens = list(notification_model.objects.values_list("notification_version", flat=True))
+        assert None not in tokens
+        assert len(set(tokens)) == 5
+
+    def test_rerunning_the_backfill_only_fills_nulls(self):
+        backfill = importlib.import_module(BACKFILL_MODULE)
+        apps = self._migrate(VERSION_ADDED)
+        notification_model = self._create(apps, 3)
+        backfill.backfill_notification_versions(apps, connection.schema_editor())
+        first = dict(notification_model.objects.values_list("pk", "notification_version"))
+        # An interrupted run, or rows inserted since: some rows still have no token.
+        self._create(apps, 2)
+
+        backfill.backfill_notification_versions(apps, connection.schema_editor())
+
+        second = dict(notification_model.objects.values_list("pk", "notification_version"))
+        assert {pk: second[pk] for pk in first} == first
+        assert len(second) == 5
+        assert None not in second.values()
+        assert len(set(second.values())) == 5
+
+    def test_0010_fills_rows_inserted_after_0009_then_requires_the_token(self):
+        apps = self._migrate(VERSION_BACKFILLED)
+        # Code predating the column, still running after 0009, inserts rows with no token.
+        notification_model = self._create(apps, 3)
+        assert notification_model.objects.filter(notification_version__isnull=True).count() == 3
+
+        apps = self._migrate(VERSION_REQUIRED)
+
+        notification_model = apps.get_model("vintasend_django", "Notification")
+        tokens = list(notification_model.objects.values_list("notification_version", flat=True))
+        assert len(tokens) == 3
+        assert None not in tokens
+        assert len(set(tokens)) == 3
+        assert not self._columns()["notification_version"].null_ok
+
+    def test_the_backend_tolerates_a_row_with_no_token_between_0009_and_0010(self):
+        from vintasend.exceptions import NotificationVersionChangedError
+
+        from vintasend_django.services.notification_backends.django_db_notification_backend import (
+            DjangoDbNotificationBackend,
+        )
+
+        apps = self._migrate(VERSION_BACKFILLED)
+        notification_model = self._create(apps, 1, status="FAILED")
+        pk = notification_model.objects.get().pk
+        backend = DjangoDbNotificationBackend()
+
+        # Listed, with the empty string as its version...
+        listed = backend.filter_notification_versions({}, 1, 10)
+        assert [(v.id, v.version) for v in listed] == [(pk, "")]
+        # ...and no token, that one included, moves it conditionally.
+        for token in ("", str(uuid.uuid4())):
+            with self.subTest(token=token):
+                with self.assertRaises(NotificationVersionChangedError):
+                    backend.requeue_notification(pk, expected_version=token)
+                with self.assertRaises(NotificationVersionChangedError):
+                    backend.repin_notification(pk, 2, expected_version=token)
+        row = notification_model.objects.get()
+        assert row.status == "FAILED"
+        assert row.requested_template_version is None
+        assert row.notification_version is None
+
+    def test_reverses_to_0007(self):
+        self._create(self._migrate(VERSION_REQUIRED), 2)
+
+        apps = self._migrate(BEFORE_VERSION)
+
+        notification_model = apps.get_model("vintasend_django", "Notification")
+        assert notification_model.objects.count() == 2
+        assert "notification_version" not in self._columns()
+
+    def test_0010_reverses_to_a_nullable_column(self):
+        self._create(self._migrate(VERSION_REQUIRED), 2)
+
+        apps = self._migrate(VERSION_BACKFILLED)
+
+        notification_model = apps.get_model("vintasend_django", "Notification")
+        assert self._columns()["notification_version"].null_ok
+        assert notification_model.objects.filter(notification_version__isnull=True).count() == 0
