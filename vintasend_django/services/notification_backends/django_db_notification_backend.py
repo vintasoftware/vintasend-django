@@ -1264,7 +1264,11 @@ class DjangoDbNotificationBackend(BaseNotificationBackend):
             low, high = connections[self.database].ops.integer_field_range(
                 pk_field.get_internal_type()
             )
-            if (low is not None and pk < low) or (high is not None and pk > high):
+            # Django before 5.0 reports no range on SQLite, whose INTEGER is 64-bit, the widest
+            # integer key of any database, so an unreported bound is the 64-bit one.
+            low = -(2**63) if low is None else low
+            high = 2**63 - 1 if high is None else high
+            if not low <= pk <= high:
                 pk = None
         # The id must survive the round trip: "0012", True or a UUID's integer value would land
         # on a row the primary does not know by that id.
