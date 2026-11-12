@@ -19,6 +19,7 @@ from unittest import mock
 from django.contrib.auth import get_user_model
 from django.core.management.color import no_style
 from django.db import connections
+from django.db.models.signals import post_init
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -818,15 +819,23 @@ class ApplySnapshotTestCase(_ReplicaCase):
             storage_identifiers=identifiers,
         )
 
-        with mock.patch.object(
-            AttachmentFileRecordModel, "from_db", wraps=AttachmentFileRecordModel.from_db
-        ) as loaded:
+        loaded: list[object] = []
+
+        def count_loaded(sender, instance, **kwargs):
+            loaded.append(instance.pk)
+
+        # Counted through post_init, which every Django fires for a loaded row. Wrapping
+        # from_db instead breaks on Django 6.1, which inspects it.
+        post_init.connect(count_loaded, sender=AttachmentFileRecordModel)
+        try:
             resolved = self.replica._snapshot_file_records([attachment])
+        finally:
+            post_init.disconnect(count_loaded, sender=AttachmentFileRecordModel)
 
         assert resolved == [same]
         # Narrowed in SQL: the record with other identifiers is never loaded. The one with an
         # extra key matches every key asked for, and is ruled out on the exact comparison.
-        assert loaded.call_count == 2
+        assert len(loaded) == 2
 
         assert (
             self.replica.apply_replication_snapshot_if_newer(
